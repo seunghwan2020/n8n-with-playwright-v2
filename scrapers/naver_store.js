@@ -183,7 +183,9 @@ async function scrape(params) {
 
     // ========== 방법 2: 페이지 내에서 fetch API 호출 ==========
     if (result.data.length === 0) {
-      var fetchResult = await page.evaluate(async function(slug, sType) {
+      var fetchResult = await page.evaluate(async function(args) {
+        var slug = args.slug;
+        var sType = args.sType;
         var apiBase = sType === 'brand'
           ? 'https://brand.naver.com/n/v2/shoppingstores/' + slug
           : 'https://smartstore.naver.com/i/v1/stores/' + slug;
@@ -211,7 +213,7 @@ async function scrape(params) {
           out.error = e.message;
         }
         return out;
-      }, storeSlug, storeType);
+      }, { slug: storeSlug, sType: storeType });
 
       if (fetchResult.products && fetchResult.products.length > 0) {
         result.method_used = 'in_page_fetch';
