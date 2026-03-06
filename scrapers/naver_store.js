@@ -196,11 +196,28 @@ async function scrape(params) {
         await searchPage.goto(searchUrl, { waitUntil: 'networkidle', timeout: 30000 });
         await searchPage.waitForTimeout(3000);
 
-        // 스크롤
+        // 스크롤 (body null 체크)
         for (var ss = 0; ss < 3; ss++) {
-          await searchPage.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
+          var canScroll = await searchPage.evaluate(function() {
+            if (!document.body) return false;
+            window.scrollTo(0, document.body.scrollHeight);
+            return true;
+          });
+          if (!canScroll) break;
           await searchPage.waitForTimeout(1500);
         }
+
+        // 디버그: 페이지 상태 확인
+        var pageStatus = await searchPage.evaluate(function() {
+          return {
+            url: window.location.href,
+            title: document.title,
+            bodyExists: !!document.body,
+            bodyLength: document.body ? document.body.innerHTML.length : 0,
+            hasNextData: !!document.getElementById('__NEXT_DATA__')
+          };
+        });
+        searchDebug.pageStatus = pageStatus;
 
         // __NEXT_DATA__ 딥서치 + DOM 추출
         var searchResult = await searchPage.evaluate(function() {
