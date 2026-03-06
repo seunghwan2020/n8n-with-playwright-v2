@@ -26,7 +26,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
 };
 
-// ============ SCRAPE v17: brand store + proxy HTTP API (no browser page!) ============
+// ============ SCRAPE v17: brand store + proxy browser page (bypassing 418) ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -53,7 +53,7 @@ async function scrape(params) {
       ? 'https://brand.naver.com/' + storeSlug
       : 'https://smartstore.naver.com/' + storeSlug;
 
-    // ===== PHASE 1+2: 브랜드스토어 (프록시 없이) =====
+    // ===== PHASE 1+2: 브랜드스토어 (프록시 없이 기본 정보 수집) =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
     console.log('[v17] P1: ' + targetUrl);
     await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
@@ -157,106 +157,77 @@ async function scrape(params) {
     await page.close();
     await ctx.close();
 
-    // ===== PHASE 3: 프록시로 순수 HTTP 요청 (페이지 렌더링 없음!) =====
+    // ===== PHASE 3: 프록시 브라우저를 열어 데이터 추출 (우회 우주방어) =====
     var purchaseMap = {};
-    var searchDebug = { totalItems: 0, matched: 0, errors: [], method: 'api_request' };
+    var searchDebug = { totalItems: 0, matched: 0, errors: [], method: 'browser_page' };
 
     if (proxy) {
       try {
-        console.log('[v17] P3: using APIRequestContext with proxy');
+        console.log('[v17] P3: using proxy browser page to bypass 418');
 
-        // 프록시 설정된 새 브라우저 컨텍스트의 request API 사용
-        // 이건 페이지를 열지 않고 순수 HTTP 요청만 보냄 — headless 감지 불가!
+        // 순수 API 대신 프록시가 장착된 새 브라우저 컨텍스트 실행
         var proxyBrowser = await chromium.launch({
           headless: true,
           proxy: proxy,
-          args: ['--no-sandbox', '--disable-setuid-sandbox']
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
         });
 
-        var apiCtx = await proxyBrowser.newContext({
-          userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          extraHTTPHeaders: {
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(storeName),
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin'
-          }
-        });
+        var searchCtx = await proxyBrowser.newContext(ctxOpts());
+        var searchPage = await searchCtx.newPage();
+        await searchPage.addInitScript(stealth);
 
-        var apiUrl = 'https://search.shopping.naver.com/api/search/all?sort=rel&pagingIndex=1&pagingSize=80&viewType=list&query=' + encodeURIComponent(storeName);
-        console.log('[v17] P3: requesting ' + apiUrl);
+        // API URL이 아닌 실제 네이버 쇼핑 검색 페이지 URL로 접속
+        var searchUrl = 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(storeName);
+        console.log('[v17] P3: navigating to ' + searchUrl);
 
-        var response = await apiCtx.request.get(apiUrl);
-        searchDebug.status = response.status();
+        var response = await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        searchDebug.status = response ? response.status() : null;
 
-        if (response.ok()) {
-          var data = await response.json();
-          searchDebug.responseKeys = Object.keys(data).slice(0, 20);
+        if (searchDebug.status === 200) {
+          // 네이버 쇼핑은 Next.js를 사용하므로 #__NEXT_DATA__ 안에 모든 상품 정보가 JSON 형태로 박혀있습니다.
+          var nextDataStr = await searchPage.evaluate(function() {
+            var el = document.querySelector('#__NEXT_DATA__');
+            return el ? el.innerText : null;
+          });
 
-          var items = [];
-          if (data.shoppingResult && data.shoppingResult.products) {
-            items = data.shoppingResult.products;
-            searchDebug.source = 'shoppingResult.products';
-          } else if (data.products) {
-            items = data.products;
-            searchDebug.source = 'products';
-          }
+          if (nextDataStr) {
+            var nextData = JSON.parse(nextDataStr);
+            var items = [];
+            
+            try {
+              // Next.js 상태값에서 상품 리스트 추출
+              items = nextData.props.pageProps.initialState.products.list || [];
+            } catch(e) {
+              searchDebug.errors.push('Could not parse products from Next.js state: ' + e.message);
+            }
 
-          searchDebug.totalItems = items.length;
+            searchDebug.totalItems = items.length;
 
-          if (items.length > 0) {
-            searchDebug.firstItemKeys = Object.keys(items[0]).slice(0, 40);
-            // purchase 관련 필드
-            var fp = items[0];
-            var pf = {};
-            var fKeys = Object.keys(fp);
-            for (var fk = 0; fk < fKeys.length; fk++) {
-              var key = fKeys[fk];
-              var lower = key.toLowerCase();
-              if (lower.indexOf('purchase') > -1 || lower.indexOf('count') > -1 ||
-                  lower.indexOf('cumul') > -1 || lower.indexOf('mall') > -1 ||
-                  lower.indexOf('channel') > -1) {
-                pf[key] = typeof fp[key] === 'object' ? JSON.stringify(fp[key]).slice(0, 100) : fp[key];
+            for (var ii = 0; ii < items.length; ii++) {
+              var itemObj = items[ii].item || items[ii]; // 구조에 따른 안전한 파싱
+              var pc = itemObj.purchaseCnt || itemObj.purchaseCount || 0;
+              var cpn = String(itemObj.channelProductNo || '');
+              var mpid = String(itemObj.mallProductId || '');
+              var pno = String(itemObj.productNo || itemObj.id || '');
+              
+              if (pc > 0) {
+                if (cpn) purchaseMap[cpn] = pc;
+                if (mpid) purchaseMap[mpid] = pc;
+                if (pno) purchaseMap[pno] = pc;
+                searchDebug.matched++;
               }
             }
-            searchDebug.purchaseFields = pf;
-            searchDebug.sampleItems = items.slice(0, 3).map(function(item) {
-              return {
-                cpn: String(item.channelProductNo || ''),
-                mpid: String(item.mallProductId || ''),
-                pc: item.purchaseCnt || item.purchaseCount || 0,
-                name: (item.productName || item.productTitle || '').slice(0, 40)
-              };
-            });
-          }
-
-          for (var ii = 0; ii < items.length; ii++) {
-            var item = items[ii];
-            var pc = item.purchaseCnt || item.purchaseCount || 0;
-            var cpn = String(item.channelProductNo || '');
-            var mpid = String(item.mallProductId || '');
-            var pno = String(item.productNo || item.id || '');
-            if (pc > 0) {
-              if (cpn) purchaseMap[cpn] = pc;
-              if (mpid) purchaseMap[mpid] = pc;
-              if (pno) purchaseMap[pno] = pc;
-              searchDebug.matched++;
-            }
+          } else {
+             searchDebug.error = "No __NEXT_DATA__ found. Page structure might have changed.";
           }
         } else {
-          searchDebug.error = 'HTTP ' + response.status();
-          // 응답 body 일부 캡처
-          try {
-            var bodyText = await response.text();
-            searchDebug.errorBody = bodyText.slice(0, 300);
-          } catch(e) {}
+          searchDebug.error = 'HTTP ' + searchDebug.status;
         }
 
         console.log('[v17] P3: status=' + searchDebug.status + ', items=' + searchDebug.totalItems + ', matched=' + searchDebug.matched);
 
-        await apiCtx.dispose();
+        await searchPage.close();
+        await searchCtx.close();
         await proxyBrowser.close();
       } catch(searchErr) {
         searchDebug.errors.push(searchErr.message || String(searchErr));
@@ -269,7 +240,7 @@ async function scrape(params) {
     result.debug.search = searchDebug;
 
     // ===== PHASE 4: 병합 =====
-    result.method_used = proxy ? 'api+http_proxy' : 'api_only';
+    result.method_used = proxy ? 'browser_page+http_proxy' : 'api_only';
     var pids = Object.keys(productMap);
     for (var fi = 0; fi < pids.length; fi++) {
       var prod = productMap[pids[fi]];
