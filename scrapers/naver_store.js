@@ -34,7 +34,7 @@ var stealth = function() {
   window.chrome = { runtime: {} };
 };
 
-// ============ SCRAPE v15 ============
+// ============ SCRAPE v16 ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -63,7 +63,7 @@ async function scrape(params) {
       : 'https://smartstore.naver.com/' + storeSlug;
 
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v15] P1: ' + targetUrl);
+    console.log('[v16] P1: ' + targetUrl);
     await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
@@ -171,22 +171,24 @@ async function scrape(params) {
 
     if (proxy) {
       try {
-        console.log('[v15] P3: launching proxy browser');
+        var args_storeName = storeName;
+        console.log('[v16] P3: launching proxy browser');
         var brProxy = await getBrowser(proxy);
         var proxyCtx = await brProxy.newContext(ctxOpts());
         var searchPage = await proxyCtx.newPage();
         await searchPage.addInitScript(stealth);
 
-        // naver.com 방문 (쿠키 확보 + 프록시 연결 확인)
-        console.log('[v15] P3: visiting naver.com via proxy');
-        await searchPage.goto('https://www.naver.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await searchPage.waitForTimeout(2000);
+        // search.shopping.naver.com 방문 (same-origin fetch 가능하게)
+        var searchHomeUrl = 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(args_storeName);
+        console.log('[v16] P3: visiting shopping page via proxy');
+        await searchPage.goto(searchHomeUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await searchPage.waitForTimeout(3000);
 
-        // 프록시 IP에서 네이버 쇼핑 API를 fetch()로 직접 호출!
-        console.log('[v15] P3: fetching shopping API via proxy IP');
+        // same-origin fetch로 네이버 쇼핑 API 호출 (CORS 우회!)
+        console.log('[v16] P3: fetching shopping API (same-origin)');
         var shopApiResult = await searchPage.evaluate(function(args) {
           var out = { items: [], error: null, status: 0, responseKeys: [], firstItemKeys: [], purchaseFields: {} };
-          var url = 'https://search.shopping.naver.com/api/search/all?sort=rel&pagingIndex=1&pagingSize=80&viewType=list&query=' + encodeURIComponent(args.query);
+          var url = '/api/search/all?sort=rel&pagingIndex=1&pagingSize=80&viewType=list&query=' + encodeURIComponent(args.query);
 
           return fetch(url, {
             credentials: 'include',
@@ -275,7 +277,7 @@ async function scrape(params) {
         }
 
         searchDebug.method = 'proxy_fetch_api';
-        console.log('[v15] P3: status=' + shopApiResult.status + ', items=' + shopApiResult.items.length + ', matched=' + searchDebug.matched);
+        console.log('[v16] P3: status=' + shopApiResult.status + ', items=' + shopApiResult.items.length + ', matched=' + searchDebug.matched);
 
         await searchPage.close();
         await proxyCtx.close();
