@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 
 function ctxOpts() {
   return {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     viewport: { width: 1920, height: 1080 },
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
@@ -12,9 +12,11 @@ function ctxOpts() {
 
 var stealth = function() {
   Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
+  Object.defineProperty(navigator, 'languages', { get: function() { return ['ko-KR', 'ko', 'en-US', 'en']; } });
+  Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v19: Stable Browser Lifecycle & Human-like Bypass 418 ============
+// ============ SCRAPE v20: Chrome Extension Interception Logic ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -35,29 +37,85 @@ async function scrape(params) {
   var ctx1 = null;
   var page1 = null;
   var productMap = {};
+  var capturedPurchaseMap = {}; // 크롬 확장 프로그램처럼 가로챈 구매건수를 저장할 맵
+  
+  result.debug.search = { matched_xhr: 0, matched_dom: 0, status: 'started' };
 
   try {
-    // ===== PHASE 1+2: 브랜드스토어 (기본 상품 정보 수집) =====
+    // 1. 단일 브라우저 인스턴스 실행 (프록시 통합 적용)
+    console.log('[v20] Starting Browser with Extension-like Interception...');
     br1 = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', '--disable-gpu']
+      proxy: proxy,
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage', 
+        '--disable-blink-features=AutomationControlled', 
+        '--disable-gpu',
+        '--window-size=1920,1080'
+      ]
     });
     ctx1 = await br1.newContext(ctxOpts());
     page1 = await ctx1.newPage();
     await page1.addInitScript(stealth);
 
-    var baseUrl = storeType === 'brand'
-      ? 'https://brand.naver.com/' + storeSlug
-      : 'https://smartstore.naver.com/' + storeSlug;
+    // 🌟 핵심 로직: 네트워크 통신(XHR/JSON) 실시간 감청 함수 🌟
+    // 네이버 페이지가 렌더링되는 동안 오가는 모든 JSON 데이터에서 구매건수(purchaseCnt)를 추출합니다.
+    var extractor = function extract(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) {
+        for (var i = 0; i < obj.length; i++) extract(obj[i]);
+      } else {
+        // 네이버가 사용하는 다양한 구매건수 필드명 탐색
+        var pc = obj.purchaseCnt || obj.purchaseCount || obj.cumulationSaleCount || obj.recentSaleCount || obj.saleCount || obj.saleAmount || 0;
+        if (typeof pc === 'object' && pc !== null) {
+            pc = pc.cumulationSaleCount || pc.recentSaleCount || pc.saleCount || 0;
+        }
+        pc = parseInt(pc, 10) || 0;
+        
+        if (pc > 0) {
+          var id1 = obj.channelProductNo;
+          var id2 = obj.mallProductId;
+          var id3 = obj.id || obj.productNo || obj.nvMid;
+          if (id1) { capturedPurchaseMap[String(id1)] = pc; result.debug.search.matched_xhr++; }
+          if (id2) { capturedPurchaseMap[String(id2)] = pc; result.debug.search.matched_xhr++; }
+          if (id3) { capturedPurchaseMap[String(id3)] = pc; result.debug.search.matched_xhr++; }
+        }
+        // 하위 노드로 재귀 탐색
+        for (var key in obj) {
+          if (Object.prototype.hasOwnProperty.call(obj, key)) extract(obj[key]);
+        }
+      }
+    };
 
+    // 브라우저 백그라운드 리스너 부착
+    page1.on('response', async function(response) {
+      if (response.status() === 200) {
+        var url = response.url();
+        if (url.indexOf('naver.com') > -1 && (url.indexOf('api') > -1 || url.indexOf('graphql') > -1 || url.indexOf('products') > -1 || url.indexOf('search') > -1)) {
+          var ct = response.headers()['content-type'] || '';
+          if (ct.indexOf('application/json') > -1) {
+            try {
+              var body = await response.json();
+              extractor(body); // 감청한 데이터에서 구매건수 파싱
+            } catch(e) {}
+          }
+        }
+      }
+    });
+
+    // 2. [PHASE 1] 스토어 페이지 방문 (쿠키 신뢰도 구축 및 기본 상품 목록 추출)
+    var baseUrl = storeType === 'brand' ? 'https://brand.naver.com/' + storeSlug : 'https://smartstore.naver.com/' + storeSlug;
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v19] P1: ' + targetUrl);
+    console.log('[v20] P1: Navigating to Brand Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page1.waitForTimeout(3000); // 리액트 렌더링 대기
+    await page1.waitForTimeout(3000); 
 
+    // 무한스크롤 시뮬레이션
     var prevHeight = 0;
-    for (var si = 0; si < 5; si++) {
+    for (var si = 0; si < 3; si++) {
       await page1.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
       await page1.waitForTimeout(1000);
       var curHeight = await page1.evaluate(function() { return document.body.scrollHeight; });
@@ -79,37 +137,14 @@ async function scrape(params) {
             if (pid) idSet[pid] = true;
           }
         }
-        if (state.homeSetting && state.homeSetting.widgets) {
-          var wKeys = Object.keys(state.homeSetting.widgets);
-          for (var wi = 0; wi < wKeys.length; wi++) {
-            var w = state.homeSetting.widgets[wKeys[wi]];
-            if (w && w.productNos) {
-              for (var pi = 0; pi < w.productNos.length; pi++) idSet[String(w.productNos[pi])] = true;
-            }
-          }
-        }
-        if (state.categoryMenu && state.categoryMenu.firstCategories) {
-          var cats = state.categoryMenu.firstCategories;
-          for (var ci = 0; ci < cats.length; ci++) {
-            if (cats[ci].mappingConfig && cats[ci].mappingConfig.mappingType === 'PRODUCT') {
-              var ids = (cats[ci].mappingConfig.mappingContent || '').split('|');
-              for (var mi = 0; mi < ids.length; mi++) if (ids[mi]) idSet[ids[mi]] = true;
-            }
-          }
-        }
-        var links = document.querySelectorAll('a[href*="/products/"]');
-        for (var li = 0; li < links.length; li++) {
-          var m = (links[li].getAttribute('href') || '').match(/products\/(\d+)/);
-          if (m) idSet[m[1]] = true;
-        }
         out.allIds = Object.keys(idSet);
       } catch(e) {}
       return out;
     });
 
     result.channel_uid = stateInfo.channelUid;
-    result.debug.totalIds = stateInfo.allIds.length;
 
+    // 스토어 자체 API를 호출하여 상품 기본 데이터 추출
     if (stateInfo.channelUid && stateInfo.allIds.length > 0) {
       var batchSize = 20;
       for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
@@ -149,153 +184,78 @@ async function scrape(params) {
         if (bi + batchSize < stateInfo.allIds.length) await page1.waitForTimeout(200);
       }
     }
-    result.debug.apiProducts = Object.keys(productMap).length;
+
+    // 3. [PHASE 2] 검색 결과 페이지 방문 (스토어 방문으로 쌓인 쿠키를 그대로 이용)
+    // 이 페이지로 이동하면 아까 걸어둔 네트워크 리스너가 검색결과 API JSON을 전부 스니핑합니다.
+    var searchUrl = 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(storeName);
+    console.log('[v20] P2: Navigating to Search Page: ' + searchUrl);
+    
+    var searchResponse = await page1.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    result.debug.search.status = searchResponse ? searchResponse.status() : 'unknown';
+    
+    await page1.waitForTimeout(4000); // 검색 API 통신 대기
+    await page1.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
+    await page1.waitForTimeout(2000);
+
+    // 🌟 최후의 보루: 화면에 렌더링된 "구매 1,234" 텍스트 직접 추출 (DOM Scraping)
+    var domPurchases = await page1.evaluate(function() {
+      var map = {};
+      var links = document.querySelectorAll('a');
+      for (var i = 0; i < links.length; i++) {
+        var link = links[i];
+        var container = link.closest('li') || link.closest('div[class^="product_item"]');
+        if (container) {
+          var text = container.innerText || '';
+          var match = text.match(/구매(?:건수)?\s*([0-9,]+)/);
+          if (match) {
+            var pc = parseInt(match[1].replace(/,/g, ''), 10);
+            var idMatch = link.href.match(/(?:products|catalog)\/([0-9]+)/);
+            if (idMatch && pc > 0) {
+              map[idMatch[1]] = pc;
+            }
+          }
+        }
+      }
+      return map;
+    });
+
+    // 스니핑한 데이터와 DOM 스크래핑 데이터 병합
+    for(var key in domPurchases) {
+      if(!capturedPurchaseMap[key]) {
+        capturedPurchaseMap[key] = domPurchases[key];
+        result.debug.search.matched_dom++;
+      }
+    }
+
+    // 4. 최종 데이터 병합
+    result.method_used = 'extension_logic(xhr_sniffing+dom_scraping)';
+    var pids = Object.keys(productMap);
+    for (var fi = 0; fi < pids.length; fi++) {
+      var prod = productMap[pids[fi]];
+      if (capturedPurchaseMap[prod.product_id]) {
+        prod.purchase_count = capturedPurchaseMap[prod.product_id];
+      }
+      result.data.push(prod);
+    }
+
+    result.debug.total = result.data.length;
+    result.debug.withPurchase = 0;
+    for (var ci = 0; ci < result.data.length; ci++) {
+      if (result.data[ci].purchase_count > 0) result.debug.withPurchase++;
+    }
+
+    if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
 
   } catch (e) {
     result.status = 'ERROR';
-    result.error = "Phase 1 Error: " + (e.message || String(e));
-    return result; 
+    result.error = e.message || String(e);
   } finally {
+    // 모든 작업이 끝난 후 브라우저 안전 종료
     if (page1) await page1.close().catch(()=>{});
     if (ctx1) await ctx1.close().catch(()=>{});
     if (br1) await br1.close().catch(()=>{});
   }
 
-
-  // ===== PHASE 3: 인간 흉내내기 (검색 우회 우주방어 v2) =====
-  var purchaseMap = {};
-  var searchDebug = { totalItems: 0, matched: 0, errors: [], method: 'browser_page_human_flow' };
-  
-  var proxyBrowser = null;
-  var searchCtx = null;
-  var searchPage = null;
-
-  if (proxy) {
-    try {
-      console.log('[v19] P3: using human-like flow to bypass 418');
-
-      proxyBrowser = await chromium.launch({
-        headless: true, 
-        proxy: proxy,
-        args: [
-          '--no-sandbox', 
-          '--disable-setuid-sandbox', 
-          '--disable-dev-shm-usage', 
-          '--disable-blink-features=AutomationControlled', 
-          '--disable-gpu',
-          '--window-size=1920,1080' 
-        ]
-      });
-
-      searchCtx = await proxyBrowser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36', 
-        viewport: { width: 1920, height: 1080 },
-        locale: 'ko-KR',
-        timezoneId: 'Asia/Seoul'
-      });
-      
-      searchPage = await searchCtx.newPage();
-      
-      await searchPage.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'languages', { get: () => ['ko-KR', 'ko', 'en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] }); 
-      });
-
-      console.log('[v19] P3: Navigating to Naver Shopping Main...');
-      await searchPage.goto('https://shopping.naver.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await searchPage.waitForTimeout(2000 + Math.random() * 2000); 
-
-      console.log('[v19] P3: Typing search query...');
-      var searchInputSelector = 'input[title="검색어 입력"], input[type="text"]'; 
-      var inputElement = await searchPage.$(searchInputSelector);
-      
-      if(inputElement) {
-         await inputElement.type(storeName, { delay: 100 }); 
-         await searchPage.keyboard.press('Enter');
-         console.log('[v19] P3: Pressed Enter, waiting for search results...');
-      } else {
-         var searchUrl = 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(storeName);
-         await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      }
-
-      await searchPage.waitForTimeout(5000); 
-      
-      await searchPage.mouse.wheel(0, 500);
-      await searchPage.waitForTimeout(1000);
-
-      searchDebug.status = 200; 
-
-      var nextDataStr = await searchPage.evaluate(function() {
-        var el = document.querySelector('#__NEXT_DATA__');
-        return el ? el.innerText : null;
-      });
-
-      if (nextDataStr) {
-        var nextData = JSON.parse(nextDataStr);
-        var items = [];
-        
-        try {
-          items = nextData.props.pageProps.initialState.products.list || [];
-        } catch(e) {
-          searchDebug.errors.push('Could not parse products from Next.js state: ' + e.message);
-        }
-
-        searchDebug.totalItems = items.length;
-
-        for (var ii = 0; ii < items.length; ii++) {
-          var itemObj = items[ii].item || items[ii];
-          if (!itemObj) continue;
-          
-          var pc = itemObj.purchaseCnt || itemObj.purchaseCount || 0;
-          var cpn = String(itemObj.channelProductNo || '');
-          var mpid = String(itemObj.mallProductId || '');
-          var pno = String(itemObj.productNo || itemObj.id || '');
-          
-          if (pc > 0) {
-            if (cpn) purchaseMap[cpn] = pc;
-            if (mpid) purchaseMap[mpid] = pc;
-            if (pno) purchaseMap[pno] = pc;
-            searchDebug.matched++;
-          }
-        }
-      } else {
-         searchDebug.error = "No __NEXT_DATA__ found. Bot might still be detected or structure changed.";
-         searchDebug.pageTitle = await searchPage.title(); 
-      }
-
-      console.log('[v19] P3: items=' + searchDebug.totalItems + ', matched=' + searchDebug.matched);
-
-    } catch(searchErr) {
-      searchDebug.errors.push(searchErr.message || String(searchErr));
-      console.log('[v19] P3 error: ' + searchErr.message);
-    } finally {
-      if (searchPage) await searchPage.close().catch(()=>{});
-      if (searchCtx) await searchCtx.close().catch(()=>{});
-      if (proxyBrowser) await proxyBrowser.close().catch(()=>{});
-    }
-  } else {
-    searchDebug.errors.push('no proxy');
-  }
-
-  result.debug.search = searchDebug;
-
-  // ===== PHASE 4: 병합 =====
-  result.method_used = proxy ? 'browser_page_human_flow+http_proxy' : 'api_only';
-  var pids = Object.keys(productMap);
-  for (var fi = 0; fi < pids.length; fi++) {
-    var prod = productMap[pids[fi]];
-    if (purchaseMap[prod.product_id]) prod.purchase_count = purchaseMap[prod.product_id];
-    result.data.push(prod);
-  }
-
-  result.debug.total = result.data.length;
-  result.debug.withPurchase = 0;
-  for (var ci = 0; ci < result.data.length; ci++) {
-    if (result.data[ci].purchase_count > 0) result.debug.withPurchase++;
-  }
-
-  if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
   return result;
 }
 
