@@ -21,10 +21,11 @@ function ctxOpts() {
   };
 }
 
-// ============ SCRAPE v10 ============
+// ============ SCRAPE v11: brand store + naver shopping search ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
+  var storeName = params.store_name || storeSlug;
   var result = { status: 'OK', data: [], channel_uid: '', error: null, method_used: '', debug: {} };
 
   var br = await getBrowser();
@@ -40,8 +41,9 @@ async function scrape(params) {
       ? 'https://brand.naver.com/' + storeSlug
       : 'https://smartstore.naver.com/' + storeSlug;
 
+    // ===== PHASE 1: 브랜드스토어에서 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v10] ' + storeSlug + ' -> ' + targetUrl);
+    console.log('[v11] Phase1: ' + targetUrl);
     await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(3000);
 
@@ -54,100 +56,53 @@ async function scrape(params) {
       if (curHeight === prevHeight) break;
       prevHeight = curHeight;
     }
-    result.debug.scrolls = si;
 
-    // STEP 1: __PRELOADED_STATE__ 디버그 + 전체 상품 ID 수집
+    // __PRELOADED_STATE__ + DOM에서 전체 상품 ID 수집
     var stateInfo = await page.evaluate(function() {
-      var out = { channelUid: '', allProductIds: [], categoryProductsSample: null, error: null };
+      var out = { channelUid: '', channelNo: '', allIds: [] };
       try {
         var state = window.__PRELOADED_STATE__;
-        if (!state) { out.error = 'no state'; return out; }
-
-        // channelUid
-        if (state.channel && state.channel.channelUid) out.channelUid = state.channel.channelUid;
-
+        if (!state) return out;
+        if (state.channel) {
+          out.channelUid = state.channel.channelUid || '';
+          out.channelNo = String(state.channel.id || state.channel.channelNo || '');
+        }
         var idSet = {};
 
-        // categoryProducts.simpleProducts 구조 확인
+        // categoryProducts
         if (state.categoryProducts && state.categoryProducts.simpleProducts) {
           var sp = state.categoryProducts.simpleProducts;
-          out.categoryProductsCount = sp.length;
-          out.categoryProductsType = typeof sp[0];
-          if (sp.length > 0) {
-            // 첫 번째 아이템이 숫자인지 객체인지 확인
-            var first = sp[0];
-            if (typeof first === 'number' || typeof first === 'string') {
-              out.categoryProductsSample = { type: 'id', value: first };
-              for (var i = 0; i < sp.length; i++) idSet[String(sp[i])] = true;
-            } else if (typeof first === 'object' && first !== null) {
-              out.categoryProductsSample = { type: 'object', keys: Object.keys(first).slice(0, 50) };
-              // 모든 필드값 중 purchase/sale/count 관련 찾기
-              var purchaseDebug = {};
-              var allKeys = Object.keys(first);
-              for (var pk = 0; pk < allKeys.length; pk++) {
-                var key = allKeys[pk];
-                var lower = key.toLowerCase();
-                if (lower.indexOf('purchase') > -1 || lower.indexOf('count') > -1 ||
-                    lower.indexOf('cumul') > -1 || lower.indexOf('order') > -1 ||
-                    (lower.indexOf('sale') > -1 && lower !== 'salePrice' && lower !== 'saleType')) {
-                  purchaseDebug[key] = first[key];
-                }
-              }
-              out.categoryProductsPurchaseFields = purchaseDebug;
-
-              for (var j = 0; j < sp.length; j++) {
-                var pid = String(sp[j].id || sp[j].channelProductNo || sp[j].productNo || '');
-                if (pid) idSet[pid] = true;
-              }
-            }
+          for (var i = 0; i < sp.length; i++) {
+            var pid = typeof sp[i] === 'object' ? String(sp[i].id || '') : String(sp[i]);
+            if (pid) idSet[pid] = true;
           }
         }
-
-        // homeSetting.widgets productNos
+        // homeSetting widgets
         if (state.homeSetting && state.homeSetting.widgets) {
-          var widgets = state.homeSetting.widgets;
-          var wKeys = Object.keys(widgets);
+          var wKeys = Object.keys(state.homeSetting.widgets);
           for (var wi = 0; wi < wKeys.length; wi++) {
-            var w = widgets[wKeys[wi]];
-            if (w && w.productNos && w.productNos.length > 0) {
-              for (var pi = 0; pi < w.productNos.length; pi++) {
-                idSet[String(w.productNos[pi])] = true;
-              }
+            var w = state.homeSetting.widgets[wKeys[wi]];
+            if (w && w.productNos) {
+              for (var pi = 0; pi < w.productNos.length; pi++) idSet[String(w.productNos[pi])] = true;
             }
           }
         }
-
-        // categoryMenu mappingContent (상품 ID 목록)
+        // categoryMenu mappingContent
         if (state.categoryMenu && state.categoryMenu.firstCategories) {
           var cats = state.categoryMenu.firstCategories;
           for (var ci = 0; ci < cats.length; ci++) {
             if (cats[ci].mappingConfig && cats[ci].mappingConfig.mappingType === 'PRODUCT') {
-              var content = cats[ci].mappingConfig.mappingContent || '';
-              var ids = content.split('|');
-              for (var mi = 0; mi < ids.length; mi++) {
-                if (ids[mi]) idSet[ids[mi]] = true;
-              }
+              var ids = (cats[ci].mappingConfig.mappingContent || '').split('|');
+              for (var mi = 0; mi < ids.length; mi++) if (ids[mi]) idSet[ids[mi]] = true;
             }
           }
         }
-
-        out.allProductIds = Object.keys(idSet);
-      } catch(e) {
-        out.error = e.message || String(e);
-      }
+        out.allIds = Object.keys(idSet);
+      } catch(e) {}
       return out;
     });
 
-    result.channel_uid = stateInfo.channelUid;
-    result.debug.channelUid = stateInfo.channelUid;
-    result.debug.categoryProductsCount = stateInfo.categoryProductsCount;
-    result.debug.categoryProductsType = stateInfo.categoryProductsType;
-    result.debug.categoryProductsSample = stateInfo.categoryProductsSample;
-    result.debug.categoryProductsPurchaseFields = stateInfo.categoryProductsPurchaseFields;
-    result.debug.stateError = stateInfo.error;
-    result.debug.allProductIdsFromState = stateInfo.allProductIds.length;
-
-    // DOM에서도 ID 수집
+    // DOM IDs 추가
     var domIds = await page.evaluate(function() {
       var ids = {};
       var links = document.querySelectorAll('a[href*="/products/"]');
@@ -157,155 +112,229 @@ async function scrape(params) {
       }
       return Object.keys(ids);
     });
-    result.debug.domIdsCount = domIds.length;
 
-    // 전체 ID 합치기
     var allIdSet = {};
-    for (var si2 = 0; si2 < stateInfo.allProductIds.length; si2++) allIdSet[stateInfo.allProductIds[si2]] = true;
-    for (var di = 0; di < domIds.length; di++) allIdSet[domIds[di]] = true;
+    for (var s1 = 0; s1 < stateInfo.allIds.length; s1++) allIdSet[stateInfo.allIds[s1]] = true;
+    for (var d1 = 0; d1 < domIds.length; d1++) allIdSet[domIds[d1]] = true;
     var allIds = Object.keys(allIdSet);
-    result.debug.totalUniqueIds = allIds.length;
 
-    // STEP 2: simple-products API 호출 (전체 ID)
+    result.channel_uid = stateInfo.channelUid;
+    result.debug.channelUid = stateInfo.channelUid;
+    result.debug.channelNo = stateInfo.channelNo;
+    result.debug.totalIds = allIds.length;
+
+    // ===== PHASE 2: simple-products API로 상품 상세 가져오기 =====
+    var productMap = {};
     if (stateInfo.channelUid && allIds.length > 0) {
       var batchSize = 20;
-      var apiProducts = [];
-      var apiDebug = { batches: 0, success: 0, errors: [], firstProductAllKeys: null, firstProductPurchaseFields: null };
-
       for (var bi = 0; bi < allIds.length; bi += batchSize) {
         var batch = allIds.slice(bi, bi + batchSize);
-        apiDebug.batches++;
-
         try {
           var apiResult = await page.evaluate(function(args) {
-            var uid = args.uid;
-            var ids = args.ids;
-            var params = ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-            var apiUrl = 'https://brand.naver.com/n/v2/channels/' + uid + '/simple-products?' + params;
-
+            var params = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
+            var apiUrl = 'https://brand.naver.com/n/v2/channels/' + args.uid + '/simple-products?' + params;
             return fetch(apiUrl, { credentials: 'include' })
-              .then(function(resp) {
-                if (!resp.ok) return { ok: false, status: resp.status };
-                return resp.json().then(function(json) {
-                  return { ok: true, data: json };
-                });
-              })
-              .catch(function(err) {
-                return { ok: false, error: err.message || String(err) };
-              });
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .catch(function() { return null; });
           }, { uid: stateInfo.channelUid, ids: batch });
 
-          if (apiResult && apiResult.ok && Array.isArray(apiResult.data)) {
-            apiDebug.success++;
+          if (Array.isArray(apiResult)) {
+            for (var ai = 0; ai < apiResult.length; ai++) {
+              var p = apiResult[ai];
+              var pid = String(p.id || '');
+              if (!pid) continue;
 
-            // 디버그: 첫 상품의 전체 키 목록
-            if (!apiDebug.firstProductAllKeys && apiResult.data.length > 0) {
-              var fp = apiResult.data[0];
-              apiDebug.firstProductAllKeys = Object.keys(fp);
-              // purchase 관련 필드 전부
-              var pf = {};
-              var fKeys = Object.keys(fp);
-              for (var fk = 0; fk < fKeys.length; fk++) {
-                var key = fKeys[fk];
-                var lower = key.toLowerCase();
-                if (lower.indexOf('purchase') > -1 || lower.indexOf('count') > -1 ||
-                    lower.indexOf('cumul') > -1 || lower.indexOf('order') > -1 ||
-                    lower.indexOf('amount') > -1 ||
-                    (lower.indexOf('sale') > -1 && lower !== 'saleprice' && lower !== 'saletype')) {
-                  pf[key] = fp[key];
+              var reviewCount = 0;
+              if (p.reviewAmount && typeof p.reviewAmount === 'object') {
+                reviewCount = p.reviewAmount.totalReviewCount || 0;
+              }
+
+              var discountPrice = null;
+              if (p.benefitsView && p.benefitsView.discountedSalePrice) {
+                discountPrice = p.benefitsView.discountedSalePrice;
+              }
+
+              productMap[pid] = {
+                product_id: pid,
+                product_name: p.name || p.dispName || '',
+                sale_price: p.salePrice || 0,
+                discount_price: discountPrice,
+                review_count: reviewCount,
+                purchase_count: 0,
+                product_image_url: (p.representativeImageUrl || '').split('?')[0],
+                category_name: p.category ? (p.category.wholeCategoryName || '') : '',
+                is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
+                product_url: baseUrl + '/products/' + pid
+              };
+            }
+          }
+        } catch(e) {}
+        if (bi + batchSize < allIds.length) await page.waitForTimeout(300);
+      }
+    }
+
+    result.debug.apiProducts = Object.keys(productMap).length;
+    console.log('[v11] Phase2: ' + Object.keys(productMap).length + ' products from API');
+
+    // ===== PHASE 3: 네이버 쇼핑 검색에서 구매건수 수집 =====
+    var purchaseMap = {};
+    var searchDebug = { pages: 0, matched: 0, totalFound: 0, errors: [] };
+
+    try {
+      // 네이버 쇼핑에서 스토어명으로 검색
+      var searchQuery = storeName;
+      var searchUrl = 'https://search.shopping.naver.com/search/all?query=' + encodeURIComponent(searchQuery)
+        + '&channel=naver_store&pageSize=80&sort=rel';
+
+      console.log('[v11] Phase3: searching ' + searchUrl);
+      await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 45000 });
+      await page.waitForTimeout(3000);
+
+      // __NEXT_DATA__ 에서 검색 결과 추출
+      var searchResult = await page.evaluate(function() {
+        var out = { products: [], error: null, source: '' };
+        try {
+          // 방법 1: __NEXT_DATA__
+          var nextDataEl = document.getElementById('__NEXT_DATA__');
+          if (nextDataEl) {
+            var nextData = JSON.parse(nextDataEl.textContent);
+            out.source = '__NEXT_DATA__';
+
+            // 검색 결과에서 상품 목록 찾기
+            var props = nextData.props || {};
+            var pageProps = props.pageProps || {};
+            var initialState = pageProps.initialState || {};
+
+            // products 경로 탐색
+            var productsData = null;
+            if (initialState.products && initialState.products.list) {
+              productsData = initialState.products.list;
+            } else if (pageProps.products) {
+              productsData = pageProps.products;
+            }
+
+            if (productsData && Array.isArray(productsData)) {
+              for (var i = 0; i < productsData.length; i++) {
+                var item = productsData[i];
+                // item.item 구조일 수 있음
+                var product = item.item || item;
+                var channelProductNo = String(product.channelProductNo || product.id || product.productNo || '');
+                var purchaseCount = product.purchaseCnt || product.purchaseCount || product.purchase_cnt || 0;
+                var mallName = product.mallName || product.storeName || '';
+
+                if (channelProductNo) {
+                  out.products.push({
+                    id: channelProductNo,
+                    productNo: String(product.productNo || ''),
+                    purchaseCount: purchaseCount,
+                    mallName: mallName,
+                    productName: (product.productName || product.name || '').slice(0, 50)
+                  });
                 }
               }
-              apiDebug.firstProductPurchaseFields = pf;
+            }
 
-              // reviewAmount 구조도 확인
-              if (fp.reviewAmount) {
-                apiDebug.reviewAmountType = typeof fp.reviewAmount;
-                if (typeof fp.reviewAmount === 'object') {
-                  apiDebug.reviewAmountKeys = Object.keys(fp.reviewAmount);
-                  apiDebug.reviewAmountSample = fp.reviewAmount;
-                }
+            // 디버그: 구조 확인
+            if (out.products.length === 0) {
+              out.nextDataKeys = Object.keys(pageProps).slice(0, 20);
+              if (initialState) out.initialStateKeys = Object.keys(initialState).slice(0, 20);
+              // 다른 경로 탐색
+              var searchProducts = initialState.products || {};
+              out.productsKeys = Object.keys(searchProducts).slice(0, 20);
+            }
+          }
+
+          // 방법 2: window.__SEARCH_STORE__ 또는 유사 글로벌
+          if (out.products.length === 0) {
+            var globals = ['__SEARCH_STORE__', '__PRELOADED_STATE__', '__INITIAL_STATE__'];
+            for (var gi = 0; gi < globals.length; gi++) {
+              if (window[globals[gi]]) {
+                out.source = globals[gi];
+                out.globalKeys = Object.keys(window[globals[gi]]).slice(0, 20);
+                break;
               }
             }
-
-            for (var ai = 0; ai < apiResult.data.length; ai++) {
-              apiProducts.push(apiResult.data[ai]);
-            }
-          } else {
-            apiDebug.errors.push('batch' + apiDebug.batches + ': ' + (apiResult ? ('status=' + apiResult.status + ' ' + (apiResult.error || '')) : 'null'));
           }
-        } catch(batchErr) {
-          apiDebug.errors.push('batch' + apiDebug.batches + ': ' + (batchErr.message || String(batchErr)));
-        }
 
-        if (bi + batchSize < allIds.length) await page.waitForTimeout(500);
-      }
-
-      result.debug.api = apiDebug;
-      result.debug.apiProductsTotal = apiProducts.length;
-
-      // 상품 데이터 변환
-      if (apiProducts.length > 0) {
-        result.method_used = 'api_direct';
-        var seen = {};
-        for (var pi2 = 0; pi2 < apiProducts.length; pi2++) {
-          var p = apiProducts[pi2];
-          var pid = String(p.id || '');
-          if (!pid || seen[pid]) continue;
-          seen[pid] = true;
-
-          // review
-          var reviewCount = 0;
-          if (p.reviewAmount) {
-            if (typeof p.reviewAmount === 'object' && p.reviewAmount.totalReviewCount !== undefined) {
-              reviewCount = p.reviewAmount.totalReviewCount;
-            } else if (typeof p.reviewAmount === 'number') {
-              reviewCount = p.reviewAmount;
+          // 방법 3: DOM에서 구매건수 텍스트 추출
+          if (out.products.length === 0) {
+            out.source = 'dom_text';
+            var allItems = document.querySelectorAll('[class*="product_item"], [class*="basicList_item"]');
+            for (var di = 0; di < allItems.length; di++) {
+              var el = allItems[di];
+              var text = (el.innerText || '').trim();
+              var linkEl = el.querySelector('a[href*="smartstore.naver.com"], a[href*="brand.naver.com"], a[href*="naver.com/products/"]');
+              var href = linkEl ? (linkEl.getAttribute('href') || '') : '';
+              var pidMatch = href.match(/products\/(\d+)/);
+              var purchaseMatch = text.match(/(\d[\d,]*)\s*\uAD6C\uB9E4/);
+              if (pidMatch) {
+                out.products.push({
+                  id: pidMatch[1],
+                  purchaseCount: purchaseMatch ? parseInt(purchaseMatch[1].replace(/,/g, '')) : 0,
+                  mallName: '',
+                  productName: ''
+                });
+              }
             }
           }
+        } catch(e) {
+          out.error = e.message || String(e);
+        }
+        return out;
+      });
 
-          // discount
-          var discountPrice = null;
-          if (p.benefitsView && p.benefitsView.discountedSalePrice) {
-            discountPrice = p.benefitsView.discountedSalePrice;
-          }
+      searchDebug.source = searchResult.source;
+      searchDebug.totalFound = searchResult.products.length;
+      searchDebug.nextDataKeys = searchResult.nextDataKeys;
+      searchDebug.initialStateKeys = searchResult.initialStateKeys;
+      searchDebug.productsKeys = searchResult.productsKeys;
+      searchDebug.globalKeys = searchResult.globalKeys;
+      searchDebug.searchError = searchResult.error;
+      searchDebug.pages = 1;
 
-          // category
-          var categoryName = '';
-          if (p.category) {
-            categoryName = p.category.wholeCategoryName || p.category.categoryName || '';
-          }
-
-          // purchase — 가능한 모든 필드 체크
-          var purchaseCount = 0;
-          if (p.purchaseCount) purchaseCount = p.purchaseCount;
-          else if (p.purchaseAmount) purchaseCount = p.purchaseAmount;
-          else if (p.totalPurchaseCount) purchaseCount = p.totalPurchaseCount;
-          else if (p.cumulationSaleCount) purchaseCount = p.cumulationSaleCount;
-          else if (p.saleCount) purchaseCount = p.saleCount;
-
-          result.data.push({
-            product_id: pid,
-            product_name: p.name || p.dispName || '',
-            sale_price: p.salePrice || p.price || 0,
-            discount_price: discountPrice,
-            review_count: reviewCount,
-            purchase_count: purchaseCount,
-            product_image_url: (p.representativeImageUrl || '').split('?')[0],
-            category_name: categoryName,
-            is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
-            product_url: baseUrl + '/products/' + pid
-          });
+      // 검색 결과를 purchaseMap에 매핑
+      for (var si2 = 0; si2 < searchResult.products.length; si2++) {
+        var sp = searchResult.products[si2];
+        if (sp.id && sp.purchaseCount > 0) {
+          purchaseMap[sp.id] = sp.purchaseCount;
+          // productNo로도 매핑 (ID 형식이 다를 수 있음)
+          if (sp.productNo) purchaseMap[sp.productNo] = sp.purchaseCount;
         }
       }
+
+      // 디버그: 첫 3개 검색 결과 샘플
+      searchDebug.sampleResults = searchResult.products.slice(0, 5).map(function(p) {
+        return { id: p.id, purchase: p.purchaseCount, name: p.productName };
+      });
+
+      searchDebug.matched = Object.keys(purchaseMap).length;
+      console.log('[v11] Phase3: ' + searchResult.products.length + ' search results, ' + Object.keys(purchaseMap).length + ' with purchaseCount');
+
+    } catch(searchErr) {
+      searchDebug.errors.push(searchErr.message || String(searchErr));
+      console.log('[v11] Phase3 error: ' + searchErr.message);
+    }
+
+    result.debug.search = searchDebug;
+
+    // ===== PHASE 4: 데이터 병합 =====
+    result.method_used = 'api+shopping_search';
+    var productIds = Object.keys(productMap);
+    for (var fi = 0; fi < productIds.length; fi++) {
+      var product = productMap[productIds[fi]];
+      if (purchaseMap[product.product_id]) {
+        product.purchase_count = purchaseMap[product.product_id];
+      }
+      result.data.push(product);
     }
 
     result.debug.total = result.data.length;
     result.debug.withPurchase = 0;
-    for (var fi = 0; fi < result.data.length; fi++) {
-      if (result.data[fi].purchase_count > 0) result.debug.withPurchase++;
+    for (var ci = 0; ci < result.data.length; ci++) {
+      if (result.data[ci].purchase_count > 0) result.debug.withPurchase++;
     }
 
-    console.log('[v10] FINAL: ' + result.data.length + ' products, method=' + result.method_used);
+    console.log('[v11] FINAL: ' + result.data.length + ' products, ' + result.debug.withPurchase + ' with purchase count');
     if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
   } catch (e) {
     result.status = 'ERROR';
