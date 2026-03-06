@@ -16,7 +16,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v27: Iframe Injection (Bypass WAF & Timeout 503) ============
+// ============ SCRAPE v28: Lightning Fast HTTP Fetch (Bypass 503 Timeout) ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -39,7 +39,7 @@ async function scrape(params) {
   var productMap = {};
 
   try {
-    console.log('[v27] Starting Browser...');
+    console.log('[v28] Starting Browser for Session Auth...');
     br1 = await chromium.launch({
       headless: true,
       proxy: proxy,
@@ -56,23 +56,13 @@ async function scrape(params) {
     page1 = await ctx1.newPage();
     await page1.addInitScript(stealth);
 
-    // 🚀 속도 극대화를 위해 불필요한 리소스(이미지/CSS 등) 로딩 원천 차단
-    await page1.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
-        route.abort();
-      } else {
-        route.continue();
-      }
-    });
-
-    // ===== PHASE 1: 스토어 메인 접속 및 상품 리스트 파싱 =====
+    // ===== PHASE 1: 스토어 메인 접속 및 방어벽(WAF) 통과, 상품 리스트 확보 =====
     var domainRoot = storeType === 'brand' ? 'https://brand.naver.com' : 'https://smartstore.naver.com';
     var baseUrl = domainRoot + '/' + storeSlug;
     var apiRoot = storeType === 'brand' ? 'https://brand.naver.com/n/v2/channels/' : 'https://smartstore.naver.com/i/v1/channels/';
 
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v27] P1: Navigating to Store: ' + targetUrl);
+    console.log('[v28] P1: Navigating to Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page1.waitForTimeout(1500); 
@@ -147,105 +137,107 @@ async function scrape(params) {
       }
     }
 
-    // ===== PHASE 2: 🚀 확장 프로그램 로직 구현 (Iframe 병렬 삽입 기법) =====
-    // 새 탭을 열거나 fetch를 쓰지 않고, 현재 창에 Iframe을 투명하게 띄워 데이터를 훔쳐옵니다. (타임아웃 완벽 해결)
-    console.log('[v27] P2: Deep scanning via parallel Iframe injections...');
+    // ===== PHASE 2: 🚀 503 에러 회피용 초고속 HTTP 직접 통신 (무거운 탭 렌더링 0%) =====
+    console.log('[v28] P2: Deep scanning via fast HTTP Context Requests...');
     var pids = Object.keys(productMap);
-    var fetchBatchSize = 10; // 10개씩 초고속으로 처리
-    
-    result.debug.fetch = { total: pids.length, success: 0 };
+    var fetchBatchSize = 6; 
+    result.debug.fetch = { total: pids.length, success: 0, errors: [] };
 
     for (var i = 0; i < pids.length; i += fetchBatchSize) {
       var fetchBatch = pids.slice(i, i + fetchBatchSize);
       
-      var countsResult = await page1.evaluate(async function(args) {
-        var results = {};
-        
-        var promises = args.ids.map(function(id) {
-            return new Promise(function(resolve) {
-                // 투명한 아이프레임 생성
-                var iframe = document.createElement('iframe');
-                iframe.src = args.baseUrl + '/products/' + id;
-                iframe.style.width = '1px';
-                iframe.style.height = '1px';
-                iframe.style.opacity = '0';
-                iframe.style.position = 'absolute';
-                iframe.style.pointerEvents = 'none';
-                
-                // 혹시 모를 로딩 지연 방지용 타임아웃 (6초)
-                var timeout = setTimeout(function() {
-                    try { document.body.removeChild(iframe); } catch(e){}
-                    resolve({ id: id, recent: 0, cumul: 0 });
-                }, 6000); 
-                
-                // 아이프레임 로딩 완료 시 데이터 추출
-                iframe.onload = function() {
-                    clearTimeout(timeout);
-                    var recent = 0, cumul = 0;
-                    try {
-                        var win = iframe.contentWindow;
-                        var doc = iframe.contentDocument;
-                        
-                        // 1. 상태 객체에서 직접 추출 (정확도 100%)
-                        if (win && win.__PRELOADED_STATE__ && win.__PRELOADED_STATE__.product && win.__PRELOADED_STATE__.product.A) {
-                            var s = win.__PRELOADED_STATE__.product.A.saleAmount;
-                            if (s) {
-                                recent = parseInt(s.recentSaleCount || 0, 10);
-                                cumul = parseInt(s.cumulationSaleCount || s.totalSaleCount || 0, 10);
-                            }
-                        }
-                        
-                        // 2. 만약 객체가 비어있다면 정규식 딥스캔 (백업)
-                        if (recent === 0 && cumul === 0 && doc) {
-                            var text = doc.documentElement.innerHTML;
-                            var rMatch = text.match(/recentSaleCount["']?\s*:\s*(\d+)/i);
-                            if (rMatch) recent = parseInt(rMatch[1], 10);
-                            
-                            var cMatch = text.match(/(?:cumulationSaleCount|totalSaleCount)["']?\s*:\s*(\d+)/i);
-                            if (cMatch) cumul = parseInt(cMatch[1], 10);
-                        }
-                    } catch(e) {}
-                    
-                    // 추출 완료 후 아이프레임 폐기
-                    setTimeout(function() {
-                        try { document.body.removeChild(iframe); } catch(e){}
-                    }, 50);
-                    
-                    resolve({ id: id, recent: recent, cumul: cumul });
-                };
-                
-                document.body.appendChild(iframe);
-            });
-        });
-        
-        // 10개의 아이프레임을 동시에 처리 후 취합
-        var arr = await Promise.all(promises);
-        for(var k=0; k<arr.length; k++) {
-            results[arr[k].id] = arr[k];
-        }
-        return results;
+      var promises = fetchBatch.map(async function(pid) {
+        try {
+          var prodUrl = productMap[pid].product_url;
+          // Playwright의 자체 request 객체를 사용하여 브라우저 탭을 열지 않고 NNB 쿠키를 동기화하여 HTTP 요청 발송
+          var resp = await ctx1.request.get(prodUrl, { timeout: 15000 });
+          
+          if (resp.ok()) {
+            var html = await resp.text();
+            var recent = 0;
+            var cumul = 0;
 
-      }, { ids: fetchBatch, baseUrl: baseUrl });
+            // 1. Next.js 데이터 객체 파싱 (최신 네이버 스토어 대응)
+            var nextMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+            if (nextMatch) {
+              try {
+                var nextData = JSON.parse(nextMatch[1]);
+                // 재귀 탐색 함수
+                function findSales(obj, depth = 0) {
+                  if (depth > 20 || !obj || typeof obj !== 'object') return null;
+                  if (obj.recentSaleCount !== undefined || obj.cumulationSaleCount !== undefined || obj.totalSaleCount !== undefined || obj.purchaseCnt !== undefined) {
+                    return {
+                      recent: parseInt(obj.recentSaleCount || obj.purchaseCnt || 0, 10),
+                      cumul: parseInt(obj.cumulationSaleCount || obj.totalSaleCount || 0, 10)
+                    };
+                  }
+                  if (Array.isArray(obj)) {
+                    for (var item of obj) {
+                      var res = findSales(item, depth + 1);
+                      if (res) return res;
+                    }
+                  } else {
+                    for (var key in obj) {
+                      var res = findSales(obj[key], depth + 1);
+                      if (res) return res;
+                    }
+                  }
+                  return null;
+                }
+                var sales = findSales(nextData);
+                if (sales) {
+                  recent = sales.recent;
+                  cumul = sales.cumul;
+                }
+              } catch (e) {}
+            }
 
-      // 취합된 결과 매핑
-      for (var id in countsResult) {
-        var c = countsResult[id];
-        productMap[id].purchase_count = c.recent > 0 ? c.recent : c.cumul;
-        productMap[id].total_purchase_count = c.cumul;
-        
-        if (c.recent > 0 || c.cumul > 0) {
-          result.debug.fetch.success++;
+            // 2. Preloaded State 파싱 (구형 네이버 스토어 대응)
+            if (recent === 0 && cumul === 0) {
+              var stateMatch = html.match(/window\.__PRELOADED_STATE__\s*=\s*(\{[\s\S]*?\})(?=<\/script>|;window)/);
+              if (stateMatch) {
+                // Preloaded state는 정규식으로 직접 긁는 것이 빠르고 안전함
+                var rMatch = stateMatch[1].match(/["']?recentSaleCount["']?\s*:\s*(\d+)/i) || stateMatch[1].match(/["']?purchaseCnt["']?\s*:\s*(\d+)/i);
+                if (rMatch) recent = parseInt(rMatch[1], 10);
+                var cMatch = stateMatch[1].match(/["']?(?:cumulationSaleCount|totalSaleCount)["']?\s*:\s*(\d+)/i);
+                if (cMatch) cumul = parseInt(cMatch[1], 10);
+              }
+            }
+
+            // 3. 최후의 보루: 전체 HTML 정규식 딥스캔 (따옴표 유무 완벽 대응)
+            if (recent === 0 && cumul === 0) {
+              var fallbackRMatch = html.match(/["']?recentSaleCount["']?\s*:\s*(\d+)/i) || html.match(/["']?purchaseCnt["']?\s*:\s*(\d+)/i) || html.match(/["']?purchaseCount["']?\s*:\s*(\d+)/i);
+              if (fallbackRMatch) recent = parseInt(fallbackRMatch[1], 10);
+              
+              var fallbackCMatch = html.match(/["']?(?:cumulationSaleCount|totalSaleCount)["']?\s*:\s*(\d+)/i);
+              if (fallbackCMatch) cumul = parseInt(fallbackCMatch[1], 10);
+            }
+
+            // 최종 데이터 매핑
+            productMap[pid].purchase_count = recent > 0 ? recent : cumul;
+            productMap[pid].total_purchase_count = cumul;
+
+            if (recent > 0 || cumul > 0) {
+              result.debug.fetch.success++;
+            } else {
+              if (html.includes('DataDome') || html.includes('접근방어')) {
+                result.debug.fetch.errors.push(`DataDome Blocked on ${pid}`);
+              }
+            }
+          } else {
+            result.debug.fetch.errors.push(`HTTP ${resp.status()} for ${pid}`);
+          }
+        } catch (e) {
+          result.debug.fetch.errors.push(`Error ${pid}: ${e.message}`);
         }
-      }
-      
-      // 서버 과부하 방지 아주 짧은 딜레이
-      if (i + fetchBatchSize < pids.length) {
-        await page1.waitForTimeout(300); 
-      }
+      });
+
+      await Promise.all(promises);
+      await new Promise(r => setTimeout(r, 300)); // 서버 부하를 막기 위한 0.3초 대기
     }
 
     // ===== PHASE 3: 최종 데이터 포맷팅 =====
-    result.method_used = 'iframe_injection_fast_v27';
+    result.method_used = 'fast_http_context_extraction_v28';
     for (var fi = 0; fi < pids.length; fi++) {
       result.data.push(productMap[pids[fi]]);
     }
