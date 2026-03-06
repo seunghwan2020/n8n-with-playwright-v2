@@ -38,8 +38,8 @@ async function scrape(params) {
     data: [],
     channel_uid: '',
     error: null,
-    method_used: 'v18_marketing_message',
-    debug: { build: 'V18_FINAL_NO_PROXY' }
+    method_used: 'v19_marketing_message',
+    debug: { build: 'V19_PRODUCTNO_FIX' }
   };
 
   var br = null;
@@ -58,7 +58,7 @@ async function scrape(params) {
 
     // ===== PHASE 1: 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v18F] P1: ' + targetUrl);
+    console.log('[v19] P1: ' + targetUrl);
     await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
@@ -159,8 +159,8 @@ async function scrape(params) {
                 dp = p.benefitsView.discountedSalePrice;
               }
 
-              // channelProductNo 추출
-              var cpn = String(p.channelProductNo || p.channelProductId || '');
+              // productNo 추출 (marketing-message API용)
+              var cpn = String(p.productNo || '');
               if (cpn) channelProductNos[pid] = cpn;
 
               productMap[pid] = {
@@ -200,13 +200,13 @@ async function scrape(params) {
     }
 
     result.debug.apiProducts = Object.keys(productMap).length;
-    result.debug.channelProductMapped = Object.keys(channelProductNos).length;
+    result.debug.productNoMapped = Object.keys(channelProductNos).length;
 
     // ===== PHASE 3: marketing-message API =====
     var purchaseDebug = { total: 0, success: 0, withPurchase: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
 
-    console.log('[v18F] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v19] P3: marketing-message for ' + allPids.length + ' products');
 
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
@@ -272,7 +272,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v18F] P3 done: ' + purchaseDebug.withPurchase + '/' + purchaseDebug.total + ' with purchase');
+    console.log('[v19] P3 done: ' + purchaseDebug.withPurchase + '/' + purchaseDebug.total + ' with purchase');
 
     // ===== PHASE 4: 결과 조립 =====
     var pids = Object.keys(productMap);
