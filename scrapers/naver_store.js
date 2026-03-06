@@ -1,6 +1,6 @@
 const { chromium } = require('playwright');
 
-console.log('🔥 LOADED FILE: scrapers/naver_store.js / BUILD = DCURVIN_PURCHASE_FIX_V28');
+console.log('🔥 LOADED FILE: scrapers/naver_store.js / BUILD = DCURVIN_PURCHASE_FIX_V29');
 
 function ctxOpts() {
   return {
@@ -16,15 +16,11 @@ function ctxOpts() {
 }
 
 function stealth() {
-  Object.defineProperty(navigator, 'webdriver', {
-    get: () => false,
-  });
+  Object.defineProperty(navigator, 'webdriver', { get: () => false });
   Object.defineProperty(navigator, 'languages', {
     get: () => ['ko-KR', 'ko', 'en-US', 'en'],
   });
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3],
-  });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
 }
 
 function toNum(v) {
@@ -34,90 +30,159 @@ function toNum(v) {
   return s ? parseInt(s, 10) : 0;
 }
 
-function deepScanForCounts(input, bucket) {
-  if (!input) return;
+function shouldIgnoreUrl(url) {
+  const u = String(url || '').toLowerCase();
+
+  if (
+    u.includes('static-resource-smartstore.pstatic.net') ||
+    u.includes('connect.facebook.net') ||
+    u.includes('google-analytics') ||
+    u.includes('googletagmanager') ||
+    u.includes('doubleclick') ||
+    u.includes('analytics') ||
+    u.endsWith('.js') ||
+    u.includes('.js?')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function recordCandidate(bucket, kind, value, path, source) {
+  const num = toNum(value);
+  if (!num) return;
+
+  if (kind === 'recent') bucket.recent = Math.max(bucket.recent, num);
+  if (kind === 'cumul') bucket.cumul = Math.max(bucket.cumul, num);
+  if (kind === 'purchase') bucket.purchase = Math.max(bucket.purchase, num);
+
+  bucket.matches.push({
+    kind,
+    value: num,
+    path: path || '',
+    source: source || '',
+  });
+}
+
+function deepScanObject(input, bucket, path = 'root', source = '') {
+  if (input === null || input === undefined) return;
+
+  if (typeof input === 'number') return;
 
   if (typeof input === 'string') {
+    const s = input;
+
+    // HTML/body text에서만 허용. JS 번들 텍스트는 source로 걸러짐.
     const patterns = [
-      { re: /recentSaleCount["']?\s*[:=]\s*(\d[\d,]*)/gi, key: 'recent' },
-      { re: /(?:cumulationSaleCount|cumulativeSaleCount|totalSaleCount|saleCountTotal)["']?\s*[:=]\s*(\d[\d,]*)/gi, key: 'cumul' },
-      { re: /(?:purchaseCount|purchaseCnt|orderCount|salesCount)["']?\s*[:=]\s*(\d[\d,]*)/gi, key: 'purchase' },
-      { re: /(?:구매|구매건수|구매수)\s*[:：]?\s*(\d[\d,]*)/gi, key: 'purchase' },
-      { re: /(?:누적판매|총판매|판매량)\s*[:：]?\s*(\d[\d,]*)/gi, key: 'cumul' },
-      { re: /(\d[\d,]*)\s*개\s*구매/gi, key: 'purchase' },
+      { re: /최근\s*구매\s*(\d[\d,]*)/gi, kind: 'purchase' },
+      { re: /구매\s*(\d[\d,]*)/gi, kind: 'purchase' },
+      { re: /누적\s*판매\s*(\d[\d,]*)/gi, kind: 'cumul' },
+      { re: /총\s*판매\s*(\d[\d,]*)/gi, kind: 'cumul' },
+      { re: /(\d[\d,]*)\s*개\s*구매/gi, kind: 'purchase' },
     ];
 
     for (const p of patterns) {
       let m;
-      while ((m = p.re.exec(input)) !== null) {
-        bucket[p.key] = Math.max(bucket[p.key] || 0, toNum(m[1]));
+      while ((m = p.re.exec(s)) !== null) {
+        recordCandidate(bucket, p.kind, m[1], path, source);
       }
     }
     return;
   }
 
   if (Array.isArray(input)) {
-    for (const v of input) deepScanForCounts(v, bucket);
+    input.forEach((v, idx) => deepScanObject(v, bucket, `${path}[${idx}]`, source));
     return;
   }
 
   if (typeof input === 'object') {
     for (const [k, v] of Object.entries(input)) {
       const lk = String(k).toLowerCase();
-      const num = toNum(v);
+      const nextPath = `${path}.${k}`;
 
-      if (lk === 'recentsalecount') bucket.recent = Math.max(bucket.recent || 0, num);
-      if (
+      // 키 이름이 정확할 때만 반응
+      if (lk === 'recentsalecount') {
+        recordCandidate(bucket, 'recent', v, nextPath, source);
+      } else if (
         lk === 'cumulationsalecount' ||
         lk === 'cumulativesalecount' ||
         lk === 'totalsalecount' ||
-        lk === 'salecounttotal'
+        lk === 'salecounttotal' ||
+        lk === 'totalsalescount'
       ) {
-        bucket.cumul = Math.max(bucket.cumul || 0, num);
-      }
-      if (
+        recordCandidate(bucket, 'cumul', v, nextPath, source);
+      } else if (
         lk === 'purchasecount' ||
         lk === 'purchasecnt' ||
         lk === 'ordercount' ||
         lk === 'salescount'
       ) {
-        bucket.purchase = Math.max(bucket.purchase || 0, num);
+        recordCandidate(bucket, 'purchase', v, nextPath, source);
       }
 
       if (typeof v === 'object' || typeof v === 'string') {
-        deepScanForCounts(v, bucket);
+        deepScanObject(v, bucket, nextPath, source);
       }
     }
   }
+}
+
+function extractUsefulMatches(matches) {
+  const uniq = [];
+  const seen = new Set();
+
+  for (const m of matches) {
+    const key = `${m.kind}|${m.value}|${m.path}|${m.source}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(m);
+  }
+
+  return uniq.slice(0, 20);
 }
 
 async function collectProductCounts(context, productUrl) {
   const page = await context.newPage();
   await page.addInitScript(stealth);
 
-  const bucket = { recent: 0, cumul: 0, purchase: 0 };
-  const matchedSources = [];
+  const bucket = {
+    recent: 0,
+    cumul: 0,
+    purchase: 0,
+    matches: [],
+    responseUrls: [],
+  };
 
   page.on('response', async (response) => {
     try {
       const url = response.url();
       const headers = response.headers();
       const contentType = String(headers['content-type'] || '').toLowerCase();
+      const resourceType = response.request().resourceType();
 
-      if (!/json|javascript|html/.test(contentType)) return;
+      if (shouldIgnoreUrl(url)) return;
       if (response.status() >= 400) return;
 
-      const text = await response.text();
-      if (!/(purchase|salecount|recentsale|cumulation|구매|판매)/i.test(text)) return;
+      // script/document/image 등은 최소화
+      if (!['xhr', 'fetch', 'document'].includes(resourceType)) return;
+      if (!/json|html|text/.test(contentType)) return;
 
-      matchedSources.push(url.slice(0, 200));
-      deepScanForCounts(text, bucket);
+      const text = await response.text();
+      if (!/(purchase|sale|order|구매|판매)/i.test(text)) return;
+
+      bucket.responseUrls.push(url);
 
       if (/json/.test(contentType)) {
         try {
           const json = JSON.parse(text);
-          deepScanForCounts(json, bucket);
+          deepScanObject(json, bucket, 'response', url);
         } catch (_) {}
+      } else {
+        // HTML document만 body text 패턴 검색
+        if (resourceType === 'document') {
+          deepScanObject(text, bucket, 'documentText', url);
+        }
       }
     } catch (_) {}
   });
@@ -128,35 +193,31 @@ async function collectProductCounts(context, productUrl) {
     await page.waitForTimeout(1500);
 
     const pageData = await page.evaluate(() => {
-      const scripts = Array.from(document.scripts || []).map((s) => s.textContent || '').join('\n');
-
       let preloaded = null;
+      let nextData = null;
+
       try {
         preloaded = window.__PRELOADED_STATE__ || null;
       } catch (_) {}
 
-      let nextData = null;
       try {
         const el = document.querySelector('#__NEXT_DATA__');
         if (el && el.textContent) nextData = JSON.parse(el.textContent);
       } catch (_) {}
 
+      const bodyText = document.body ? document.body.innerText : '';
+
       return {
         title: document.title || '',
-        bodyText: document.body ? document.body.innerText : '',
-        html: document.documentElement ? document.documentElement.outerHTML : '',
-        scripts,
+        bodyText,
         preloaded,
         nextData,
       };
     });
 
-    deepScanForCounts(pageData.title, bucket);
-    deepScanForCounts(pageData.bodyText, bucket);
-    deepScanForCounts(pageData.html, bucket);
-    deepScanForCounts(pageData.scripts, bucket);
-    deepScanForCounts(pageData.preloaded, bucket);
-    deepScanForCounts(pageData.nextData, bucket);
+    deepScanObject(pageData.preloaded, bucket, 'window.__PRELOADED_STATE__', 'pageState');
+    deepScanObject(pageData.nextData, bucket, '__NEXT_DATA__', 'pageState');
+    deepScanObject(pageData.bodyText, bucket, 'document.body.innerText', 'domText');
   } finally {
     await page.close().catch(() => {});
   }
@@ -165,12 +226,13 @@ async function collectProductCounts(context, productUrl) {
     recent: bucket.recent || 0,
     cumul: bucket.cumul || 0,
     purchase: bucket.purchase || 0,
-    matchedSources: matchedSources.slice(0, 10),
+    matchedSources: [...new Set(bucket.responseUrls)].slice(0, 10),
+    matches: extractUsefulMatches(bucket.matches),
   };
 }
 
 async function scrape(params) {
-  console.log('🔥 RUNNING scrape() / BUILD = DCURVIN_PURCHASE_FIX_V28');
+  console.log('🔥 RUNNING scrape() / BUILD = DCURVIN_PURCHASE_FIX_V29');
 
   const storeSlug = params.store_slug;
   const storeType = params.store_type || 'brand';
@@ -180,9 +242,9 @@ async function scrape(params) {
     data: [],
     channel_uid: '',
     error: null,
-    method_used: 'DCURVIN_PURCHASE_FIX_V28',
+    method_used: 'DCURVIN_PURCHASE_FIX_V29',
     debug: {
-      build: 'DCURVIN_PURCHASE_FIX_V28',
+      build: 'DCURVIN_PURCHASE_FIX_V29',
       proxyEnabled: false,
       fetch: {
         total: 0,
@@ -232,13 +294,15 @@ async function scrape(params) {
       return route.continue();
     });
 
-    const domainRoot = storeType === 'brand'
-      ? 'https://brand.naver.com'
-      : 'https://smartstore.naver.com';
+    const domainRoot =
+      storeType === 'brand'
+        ? 'https://brand.naver.com'
+        : 'https://smartstore.naver.com';
 
-    const apiRoot = storeType === 'brand'
-      ? 'https://brand.naver.com/n/v2/channels/'
-      : 'https://smartstore.naver.com/i/v1/channels/';
+    const apiRoot =
+      storeType === 'brand'
+        ? 'https://brand.naver.com/n/v2/channels/'
+        : 'https://smartstore.naver.com/i/v1/channels/';
 
     const baseUrl = `${domainRoot}/${storeSlug}`;
     const targetUrl = `${baseUrl}/category/ALL?st=POPULAR&dt=LIST&page=1&size=80`;
@@ -253,11 +317,14 @@ async function scrape(params) {
 
     const stateInfo = await page.evaluate(() => {
       const out = { channelUid: '', allIds: [] };
+
       try {
         const state = window.__PRELOADED_STATE__;
         if (!state) return out;
 
-        if (state.channel && state.channel.channelUid) out.channelUid = state.channel.channelUid;
+        if (state.channel && state.channel.channelUid) {
+          out.channelUid = state.channel.channelUid;
+        }
 
         const idSet = {};
         if (state.categoryProducts && state.categoryProducts.simpleProducts) {
@@ -266,8 +333,10 @@ async function scrape(params) {
             if (pid) idSet[pid] = true;
           }
         }
+
         out.allIds = Object.keys(idSet);
       } catch (_) {}
+
       return out;
     });
 
@@ -320,6 +389,7 @@ async function scrape(params) {
               p.productStatusType === 'OUTOFSTOCK' || p.soldout === true || false,
             product_url: `${baseUrl}/products/${pid}`,
             debug_purchase_source: '',
+            debug_purchase_matches: [],
           };
         }
       }
@@ -340,6 +410,7 @@ async function scrape(params) {
             cumul: 0,
             purchase: 0,
             matchedSources: [],
+            matches: [],
           }));
           return { id, counts };
         })
@@ -350,9 +421,10 @@ async function scrape(params) {
         const cumul = counts.cumul || 0;
         const purchase = counts.purchase || 0;
 
-        productMap[id].purchase_count = recent || purchase || cumul || 0;
+        productMap[id].purchase_count = recent || purchase || 0;
         productMap[id].total_purchase_count = cumul || purchase || recent || 0;
         productMap[id].debug_purchase_source = (counts.matchedSources || []).join(' | ');
+        productMap[id].debug_purchase_matches = counts.matches || [];
 
         if (recent || cumul || purchase) {
           result.debug.fetch.success++;
