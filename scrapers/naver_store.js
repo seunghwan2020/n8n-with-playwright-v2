@@ -16,7 +16,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v21: Product Detail Page Direct Fetch ============
+// ============ SCRAPE v22: Fixed API URL & Product Detail Direct Fetch ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -39,7 +39,7 @@ async function scrape(params) {
   var productMap = {};
 
   try {
-    console.log('[v21] Starting Browser...');
+    console.log('[v22] Starting Browser...');
     br1 = await chromium.launch({
       headless: true,
       proxy: proxy,
@@ -57,9 +57,13 @@ async function scrape(params) {
     await page1.addInitScript(stealth);
 
     // ===== PHASE 1: 브랜드 스토어 접속 및 기본 데이터 파싱 =====
-    var baseUrl = storeType === 'brand' ? 'https://brand.naver.com/' + storeSlug : 'https://smartstore.naver.com/' + storeSlug;
+    // URL 생성 규칙 수정 (오류 원인 해결)
+    var domainRoot = storeType === 'brand' ? 'https://brand.naver.com' : 'https://smartstore.naver.com';
+    var baseUrl = domainRoot + '/' + storeSlug;
+    var apiRoot = storeType === 'brand' ? 'https://brand.naver.com/n/v2/channels/' : 'https://smartstore.naver.com/i/v1/channels/';
+
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v21] P1: Navigating to Brand Store: ' + targetUrl);
+    console.log('[v22] P1: Navigating to Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page1.waitForTimeout(3000); 
@@ -101,10 +105,11 @@ async function scrape(params) {
         try {
           var apiResult = await page1.evaluate(function(args) {
             var params = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-            return fetch(args.baseUrl + '/n/v2/channels/' + args.uid + '/simple-products?' + params, { credentials: 'include' })
+            // 정상적인 API 루트로 호출하도록 수정됨
+            return fetch(args.apiRoot + args.uid + '/simple-products?' + params, { credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
-          }, { uid: stateInfo.channelUid, ids: batch, baseUrl: baseUrl });
+          }, { uid: stateInfo.channelUid, ids: batch, apiRoot: apiRoot });
 
           if (Array.isArray(apiResult)) {
             for (var ai = 0; ai < apiResult.length; ai++) {
@@ -122,7 +127,7 @@ async function scrape(params) {
                 discount_price: dp,
                 review_count: rc,
                 purchase_count: 0, 
-                total_purchase_count: 0, // 누적 구매건수를 추가로 담을 공간
+                total_purchase_count: 0, 
                 product_image_url: (p.representativeImageUrl || '').split('?')[0],
                 category_name: p.category ? (p.category.wholeCategoryName || '') : '',
                 is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
@@ -136,7 +141,7 @@ async function scrape(params) {
     }
 
     // ===== PHASE 2: 상품 개별 페이지 직접 파싱 (WAF 우회 및 정확도 100%) =====
-    console.log('[v21] P2: Fetching individual product pages to extract purchase counts...');
+    console.log('[v22] P2: Fetching individual product pages to extract purchase counts...');
     var pids = Object.keys(productMap);
     var fetchBatchSize = 5; // 한 번에 5개씩만 통신하여 봇 탐지 회피
     
@@ -150,19 +155,18 @@ async function scrape(params) {
         for (var j = 0; j < args.ids.length; j++) {
           var id = args.ids[j];
           try {
-            // 브라우저 내부에서 해당 스토어의 상품 상세페이지 HTML을 직접 호출
+            // 상품 상세페이지 HTML 직접 호출
             var r = await fetch(args.baseUrl + '/products/' + id);
             if (r.ok) {
               var text = await r.text();
               var recent = 0;
               var cumul = 0;
               
-              // 정규식으로 최근 구매건수(recentSaleCount) 추출
-              var rm = text.match(/"recentSaleCount"\s*:\s*(\d+)/);
+              // 다양한 구매건수 변수명을 아우르는 정규식
+              var rm = text.match(/"recentSaleCount"\s*:\s*(\d+)/) || text.match(/"purchaseCount"\s*:\s*(\d+)/);
               if (rm) recent = parseInt(rm[1], 10);
               
-              // 정규식으로 누적 구매건수(cumulationSaleCount) 추출
-              var cm = text.match(/"cumulationSaleCount"\s*:\s*(\d+)/);
+              var cm = text.match(/"cumulationSaleCount"\s*:\s*(\d+)/) || text.match(/"totalSaleCount"\s*:\s*(\d+)/);
               if (cm) cumul = parseInt(cm[1], 10);
               
               results[id] = { recent: recent, cumul: cumul };
@@ -175,9 +179,7 @@ async function scrape(params) {
       // 결과 병합
       for (var id in countsResult) {
         var c = countsResult[id];
-        // purchase_count에는 '최근 구매건수'를 우선 배정하고 없으면 '누적'을 배정
         productMap[id].purchase_count = c.recent > 0 ? c.recent : c.cumul;
-        // total_purchase_count에는 '전체 누적 구매건수'를 별도로 저장
         productMap[id].total_purchase_count = c.cumul;
         
         if (c.recent > 0 || c.cumul > 0) {
@@ -185,14 +187,13 @@ async function scrape(params) {
         }
       }
       
-      // 서버에 무리를 주지 않기 위해 1초 대기
       if (i + fetchBatchSize < pids.length) {
-        await page1.waitForTimeout(1000);
+        await page1.waitForTimeout(1000); // 서버 부하 방지용 딜레이
       }
     }
 
     // ===== PHASE 3: 최종 데이터 포맷팅 =====
-    result.method_used = 'product_page_direct_fetch';
+    result.method_used = 'product_page_direct_fetch_v22';
     for (var fi = 0; fi < pids.length; fi++) {
       result.data.push(productMap[pids[fi]]);
     }
