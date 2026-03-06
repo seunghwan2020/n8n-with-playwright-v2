@@ -16,7 +16,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v25: Extension Deep Scan Logic (No-Quote Regex & Recursive) ============
+// ============ SCRAPE v26: Timeout Fix (Parallel Fetch & Resource Blocking) ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -39,7 +39,7 @@ async function scrape(params) {
   var productMap = {};
 
   try {
-    console.log('[v25] Starting Browser...');
+    console.log('[v26] Starting Browser with Speed Optimizations...');
     br1 = await chromium.launch({
       headless: true,
       proxy: proxy,
@@ -56,22 +56,32 @@ async function scrape(params) {
     page1 = await ctx1.newPage();
     await page1.addInitScript(stealth);
 
+    // 🚀 속도 최적화 1: 불필요한 리소스 완전 차단 (이미지, 비디오, 폰트, CSS)
+    await page1.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['image', 'media', 'font', 'stylesheet'].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
+
     // ===== PHASE 1: 스토어 메인 접속 및 상품 기본 정보 추출 =====
     var domainRoot = storeType === 'brand' ? 'https://brand.naver.com' : 'https://smartstore.naver.com';
     var baseUrl = domainRoot + '/' + storeSlug;
     var apiRoot = storeType === 'brand' ? 'https://brand.naver.com/n/v2/channels/' : 'https://smartstore.naver.com/i/v1/channels/';
 
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v25] P1: Navigating to Store: ' + targetUrl);
+    console.log('[v26] P1: Navigating to Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page1.waitForTimeout(3000); 
+    await page1.waitForTimeout(1500); 
 
-    // 스크롤 (봇 회피 및 페이지 로딩 트리거)
+    // 🚀 속도 최적화 2: 봇 회피 스크롤 딜레이 단축 (1000ms -> 500ms)
     var prevHeight = 0;
     for (var si = 0; si < 3; si++) {
       await page1.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
-      await page1.waitForTimeout(1000);
+      await page1.waitForTimeout(500);
       var curHeight = await page1.evaluate(function() { return document.body.scrollHeight; });
       if (curHeight === prevHeight) break;
       prevHeight = curHeight;
@@ -135,26 +145,24 @@ async function scrape(params) {
             }
           }
         } catch(e) {}
-        if (bi + batchSize < stateInfo.allIds.length) await page1.waitForTimeout(200);
       }
     }
 
-    // ===== PHASE 2: 확장 프로그램 완벽 빙의 (딥 스캔 XHR 통신) =====
-    console.log('[v25] P2: Deep scanning product pages for hidden sales data...');
+    // ===== PHASE 2: 🚀 속도 최적화 3: 비동기 병렬 처리 (Parallel Fetch) =====
+    console.log('[v26] P2: Parallel fetching individual product pages (Deep Scan)...');
     var pids = Object.keys(productMap);
-    var fetchBatchSize = 4; // 너무 빠르면 막히므로 4개씩
+    var fetchBatchSize = 10; // 한 번에 10개씩 폭풍 수집
     
     result.debug.fetch = { total: pids.length, success: 0 };
 
     for (var i = 0; i < pids.length; i += fetchBatchSize) {
       var fetchBatch = pids.slice(i, i + fetchBatchSize);
       
-      // 현재 브라우저 페이지(page1) 안에서 fetch를 실행하여 소스코드를 뜯어옴 (WAF 통과된 상태 활용)
       var countsResult = await page1.evaluate(async function(args) {
         var results = {};
         
-        for (var j = 0; j < args.ids.length; j++) {
-          var id = args.ids[j];
+        // 순차 처리가 아닌 Promise.all을 이용해 10개를 동시에 비동기로 긁어옵니다.
+        var fetchPromises = args.ids.map(async function(id) {
           try {
             var r = await fetch(args.baseUrl + '/products/' + id);
             if (r.ok) {
@@ -162,8 +170,6 @@ async function scrape(params) {
               var recent = 0;
               var cumul = 0;
               
-              // [핵심 1] 따옴표 없는 변수명까지 모조리 잡아내는 '확장 프로그램식' 포괄적 정규식
-              // recentSaleCount : 15  또는 "recentSaleCount":15 모두 매칭
               var rRegex = /recentSaleCount["']?\s*:\s*(\d+)/g;
               var cRegex = /(?:cumulationSaleCount|totalSaleCount|purchaseCount|purchaseCnt)["']?\s*:\s*(\d+)/g;
               
@@ -177,14 +183,12 @@ async function scrape(params) {
                   cumul = Math.max(cumul, parseInt(cMatch[1], 10));
               }
 
-              // [핵심 2] 혹시라도 정규식으로 못 찾았을 경우, 상태 객체를 직접 파싱하여 재귀 탐색 (백업)
               if (recent === 0 && cumul === 0) {
                   var stateMatch = text.match(/window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})(?=<\/script>|;window)/s);
                   if (stateMatch) {
                       try {
                           var stateObj = JSON.parse(stateMatch[1]);
                           
-                          // 전체 객체를 돌면서 키값에 sale이 포함된 숫자를 다 찾음
                           function searchObj(obj) {
                               if (!obj || typeof obj !== 'object') return;
                               if (Array.isArray(obj)) {
@@ -209,14 +213,17 @@ async function scrape(params) {
               results[id] = { recent: recent, cumul: cumul };
             }
           } catch(e) {}
-        }
+        });
+
+        // 10개의 요청을 동시에 끝낼 때까지 대기 (약 1초 내외 소요)
+        await Promise.all(fetchPromises);
         return results;
+
       }, { ids: fetchBatch, baseUrl: baseUrl });
 
       // 결과 매핑
       for (var id in countsResult) {
         var c = countsResult[id];
-        // 최근 판매건수 우선, 없으면 누적 판매건수를 purchase_count에 대입
         productMap[id].purchase_count = c.recent > 0 ? c.recent : c.cumul;
         productMap[id].total_purchase_count = c.cumul;
         
@@ -226,12 +233,12 @@ async function scrape(params) {
       }
       
       if (i + fetchBatchSize < pids.length) {
-        await page1.waitForTimeout(1000); // 디도스 방지 딜레이
+        await page1.waitForTimeout(300); // 디도스 방지용 짧은 딜레이
       }
     }
 
     // ===== PHASE 3: 최종 데이터 포맷팅 =====
-    result.method_used = 'extension_deep_scan_v25';
+    result.method_used = 'parallel_deep_scan_v26';
     for (var fi = 0; fi < pids.length; fi++) {
       result.data.push(productMap[pids[fi]]);
     }
