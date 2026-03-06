@@ -1,517 +1,340 @@
 const { chromium } = require('playwright');
 
-console.log('🔥 LOADED FILE: scrapers/naver_store.js / BUILD = DCURVIN_PURCHASE_FIX_V31');
+let browser = null;
+
+async function getBrowser() {
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
+    });
+  }
+  return browser;
+}
 
 function ctxOpts() {
   return {
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    viewport: { width: 1600, height: 900 },
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1920, height: 1080 },
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
-    extraHTTPHeaders: {
-      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    },
+    extraHTTPHeaders: { 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7' }
   };
 }
 
-function stealth() {
-  Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  Object.defineProperty(navigator, 'languages', {
-    get: () => ['ko-KR', 'ko', 'en-US', 'en'],
-  });
-  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+var stealth = function() {
+  Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
+  Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3, 4, 5]; } });
+  Object.defineProperty(navigator, 'languages', { get: function() { return ['ko-KR', 'ko', 'en-US', 'en']; } });
+  window.chrome = { runtime: {} };
+};
+
+// "9명 이상 구매" -> 9, "1,234명 구매" -> 1234
+function parsePurchaseCount(phrase) {
+  if (!phrase) return 0;
+  var m = phrase.match(/(\d[\d,]*)\s*\uBA85/);
+  if (m) return parseInt(m[1].replace(/,/g, ''));
+  return 0;
 }
 
-function toNum(v) {
-  if (v === null || v === undefined) return 0;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
-  const s = String(v).replace(/[^\d]/g, '');
-  return s ? parseInt(s, 10) : 0;
-}
+// ============ SCRAPE v18: brand store + marketing-message API ============
+async function scrape(params) {
+  var storeSlug = params.store_slug;
+  var storeType = params.store_type || 'brand';
+  var storeName = params.store_name || storeSlug;
+  var result = { status: 'OK', data: [], channel_uid: '', error: null, method_used: 'api+marketing_message', debug: {} };
 
-function shouldIgnoreUrl(url) {
-  const u = String(url || '').toLowerCase();
-
-  if (
-    u.includes('static-resource-smartstore.pstatic.net') ||
-    u.includes('connect.facebook.net') ||
-    u.includes('google-analytics') ||
-    u.includes('googletagmanager') ||
-    u.includes('doubleclick') ||
-    u.includes('analytics') ||
-    u.endsWith('.js') ||
-    u.includes('.js?')
-  ) return true;
-
-  return false;
-}
-
-function isReviewUrl(url) {
-  const u = String(url || '').toLowerCase();
-  return (
-    u.includes('/contents/reviews/') ||
-    u.includes('/reviews/') ||
-    u.includes('store_pick') ||
-    u.includes('photo_video')
-  );
-}
-
-function isMarketingMessageUrl(url) {
-  return String(url || '').toLowerCase().includes('/marketing-message/');
-}
-
-function isAllowedProductUrl(url) {
-  const u = String(url || '').toLowerCase();
-
-  if (isReviewUrl(u)) return false;
-
-  return (
-    u.includes('/products/') ||
-    u.includes('/group-products/') ||
-    u.includes('/simple-products') ||
-    u.includes('/product-benefits/') ||
-    u.includes('/marketing-message/')
-  );
-}
-
-function recordCandidate(bucket, kind, value, path, source, rawText) {
-  const num = toNum(value);
-  if (!num) return;
-
-  if (kind === 'recent') bucket.recent = Math.max(bucket.recent, num);
-  if (kind === 'cumul') bucket.cumul = Math.max(bucket.cumul, num);
-  if (kind === 'purchase') bucket.purchase = Math.max(bucket.purchase, num);
-
-  bucket.matches.push({
-    kind,
-    value: num,
-    path: path || '',
-    source: source || '',
-    raw: rawText ? String(rawText).slice(0, 160) : '',
-  });
-}
-
-function deepScanStrictObject(input, bucket, path = 'root', source = '') {
-  if (input === null || input === undefined) return;
-
-  if (Array.isArray(input)) {
-    input.forEach((v, idx) => {
-      deepScanStrictObject(v, bucket, `${path}[${idx}]`, source);
-    });
-    return;
-  }
-
-  if (typeof input !== 'object') return;
-
-  for (const [k, v] of Object.entries(input)) {
-    const lk = String(k).toLowerCase();
-    const nextPath = `${path}.${k}`;
-
-    if (
-      lk.includes('review') ||
-      lk === 'reviewcontent' ||
-      lk === 'content' ||
-      lk === 'description'
-    ) {
-      continue;
-    }
-
-    if (lk === 'recentsalecount') {
-      recordCandidate(bucket, 'recent', v, nextPath, source);
-    } else if (
-      lk === 'cumulationsalecount' ||
-      lk === 'cumulativesalecount' ||
-      lk === 'totalsalecount' ||
-      lk === 'salecounttotal' ||
-      lk === 'totalsalescount'
-    ) {
-      recordCandidate(bucket, 'cumul', v, nextPath, source);
-    } else if (
-      lk === 'purchasecount' ||
-      lk === 'purchasecnt' ||
-      lk === 'ordercount' ||
-      lk === 'salescount'
-    ) {
-      recordCandidate(bucket, 'purchase', v, nextPath, source);
-    }
-
-    if (typeof v === 'object' && v !== null) {
-      deepScanStrictObject(v, bucket, nextPath, source);
-    }
-  }
-}
-
-function deepScanMarketingMessage(input, bucket, path = 'root', source = '') {
-  if (input === null || input === undefined) return;
-
-  if (Array.isArray(input)) {
-    input.forEach((v, idx) => {
-      deepScanMarketingMessage(v, bucket, `${path}[${idx}]`, source);
-    });
-    return;
-  }
-
-  if (typeof input === 'string') {
-    const s = input;
-
-    const patterns = [
-      /(\d[\d,]*)\s*명이\s*구매/gi,
-      /(\d[\d,]*)\s*명이\s*구매했/gi,
-      /(\d[\d,]*)\s*개\s*구매/gi,
-      /최근[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|명)[^가-힣]{0,5}구매/gi,
-      /(\d[\d,]*)\s*(?:건|회)\s*구매/gi,
-      /누적[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|건|회|명)/gi,
-      /총[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|건|회|명)/gi,
-    ];
-
-    for (const re of patterns) {
-      let m;
-      while ((m = re.exec(s)) !== null) {
-        recordCandidate(bucket, 'purchase', m[1], path, source, s);
-      }
-    }
-    return;
-  }
-
-  if (typeof input !== 'object') return;
-
-  for (const [k, v] of Object.entries(input)) {
-    const nextPath = `${path}.${k}`;
-    if (typeof v === 'string' || typeof v === 'object') {
-      deepScanMarketingMessage(v, bucket, nextPath, source);
-    }
-  }
-}
-
-function extractUsefulMatches(matches) {
-  const uniq = [];
-  const seen = new Set();
-
-  for (const m of matches) {
-    const key = `${m.kind}|${m.value}|${m.path}|${m.source}|${m.raw}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniq.push(m);
-  }
-
-  return uniq.slice(0, 30);
-}
-
-async function collectProductCounts(context, productUrl) {
-  const page = await context.newPage();
+  var br = await getBrowser();
+  var ctx = await br.newContext(ctxOpts());
+  var page = await ctx.newPage();
   await page.addInitScript(stealth);
 
-  const bucket = {
-    recent: 0,
-    cumul: 0,
-    purchase: 0,
-    matches: [],
-    responseUrls: [],
-  };
-
-  page.on('response', async (response) => {
-    try {
-      const url = response.url();
-      const headers = response.headers();
-      const contentType = String(headers['content-type'] || '').toLowerCase();
-      const resourceType = response.request().resourceType();
-
-      if (shouldIgnoreUrl(url)) return;
-      if (!isAllowedProductUrl(url)) return;
-      if (response.status() >= 400) return;
-      if (!['xhr', 'fetch', 'document'].includes(resourceType)) return;
-      if (!/json|html|text/.test(contentType)) return;
-
-      const text = await response.text();
-      bucket.responseUrls.push(url);
-
-      if (/json/.test(contentType)) {
-        try {
-          const json = JSON.parse(text);
-
-          if (isMarketingMessageUrl(url)) {
-            deepScanMarketingMessage(json, bucket, 'response', url);
-          } else {
-            deepScanStrictObject(json, bucket, 'response', url);
-          }
-        } catch (_) {}
-      }
-    } catch (_) {}
-  });
-
   try {
-    await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(1800);
+    var baseUrl = storeType === 'brand'
+      ? 'https://brand.naver.com/' + storeSlug
+      : 'https://smartstore.naver.com/' + storeSlug;
 
-    const pageData = await page.evaluate(() => {
-      let preloaded = null;
-      let nextData = null;
+    // ===== PHASE 1: 상품 ID 수집 =====
+    var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
+    console.log('[v18] P1: ' + targetUrl);
+    await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
 
-      try {
-        preloaded = window.__PRELOADED_STATE__ || null;
-      } catch (_) {}
-
-      try {
-        const el = document.querySelector('#__NEXT_DATA__');
-        if (el && el.textContent) nextData = JSON.parse(el.textContent);
-      } catch (_) {}
-
-      return {
-        preloaded,
-        nextData,
-      };
-    });
-
-    deepScanStrictObject(pageData.preloaded, bucket, 'window.__PRELOADED_STATE__', 'pageState');
-    deepScanStrictObject(pageData.nextData, bucket, '__NEXT_DATA__', 'pageState');
-  } finally {
-    await page.close().catch(() => {});
-  }
-
-  return {
-    recent: bucket.recent || 0,
-    cumul: bucket.cumul || 0,
-    purchase: bucket.purchase || 0,
-    matchedSources: [...new Set(bucket.responseUrls)].slice(0, 12),
-    matches: extractUsefulMatches(bucket.matches),
-  };
-}
-
-async function scrape(params) {
-  console.log('🔥 RUNNING scrape() / BUILD = DCURVIN_PURCHASE_FIX_V31');
-
-  const storeSlug = params.store_slug;
-  const storeType = params.store_type || 'brand';
-
-  const result = {
-    status: 'OK',
-    data: [],
-    channel_uid: '',
-    error: null,
-    method_used: 'DCURVIN_PURCHASE_FIX_V31',
-    debug: {
-      build: 'DCURVIN_PURCHASE_FIX_V31',
-      proxyEnabled: false,
-      fetch: {
-        total: 0,
-        success: 0,
-        fallbackDomUsed: 0,
-      },
-    },
-  };
-
-  let proxy = null;
-  if (params.proxy_host && params.proxy_port) {
-    proxy = {
-      server: `http://${params.proxy_host}:${params.proxy_port}`,
-    };
-    if (params.proxy_user && params.proxy_pass) {
-      proxy.username = params.proxy_user;
-      proxy.password = params.proxy_pass;
-    }
-    result.debug.proxyEnabled = true;
-  }
-
-  let browser = null;
-  let context = null;
-  let page = null;
-  const productMap = {};
-
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      proxy,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-gpu',
-      ],
-    });
-
-    context = await browser.newContext(ctxOpts());
-    page = await context.newPage();
-    await page.addInitScript(stealth);
-
-    await page.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'media', 'font'].includes(type)) return route.abort();
-      return route.continue();
-    });
-
-    const domainRoot =
-      storeType === 'brand'
-        ? 'https://brand.naver.com'
-        : 'https://smartstore.naver.com';
-
-    const apiRoot =
-      storeType === 'brand'
-        ? 'https://brand.naver.com/n/v2/channels/'
-        : 'https://smartstore.naver.com/i/v1/channels/';
-
-    const baseUrl = `${domainRoot}/${storeSlug}`;
-    const targetUrl = `${baseUrl}/category/ALL?st=POPULAR&dt=LIST&page=1&size=80`;
-
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(1500);
-
-    for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(500);
+    var prevHeight = 0;
+    for (var si = 0; si < 5; si++) {
+      await page.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
+      await page.waitForTimeout(1500);
+      var curHeight = await page.evaluate(function() { return document.body.scrollHeight; });
+      if (curHeight === prevHeight) break;
+      prevHeight = curHeight;
     }
 
-    const stateInfo = await page.evaluate(() => {
-      const out = { channelUid: '', allIds: [] };
-
+    var stateInfo = await page.evaluate(function() {
+      var out = { channelUid: '', allIds: [] };
       try {
-        const state = window.__PRELOADED_STATE__;
+        var state = window.__PRELOADED_STATE__;
         if (!state) return out;
-
-        if (state.channel && state.channel.channelUid) {
-          out.channelUid = state.channel.channelUid;
-        }
-
-        const idSet = {};
+        if (state.channel && state.channel.channelUid) out.channelUid = state.channel.channelUid;
+        var idSet = {};
         if (state.categoryProducts && state.categoryProducts.simpleProducts) {
-          for (const item of state.categoryProducts.simpleProducts) {
-            const pid = typeof item === 'object' ? String(item.id || '') : String(item || '');
+          var sp = state.categoryProducts.simpleProducts;
+          for (var i = 0; i < sp.length; i++) {
+            var pid = typeof sp[i] === 'object' ? String(sp[i].id || '') : String(sp[i]);
             if (pid) idSet[pid] = true;
           }
         }
-
+        if (state.homeSetting && state.homeSetting.widgets) {
+          var wKeys = Object.keys(state.homeSetting.widgets);
+          for (var wi = 0; wi < wKeys.length; wi++) {
+            var w = state.homeSetting.widgets[wKeys[wi]];
+            if (w && w.productNos) {
+              for (var pi = 0; pi < w.productNos.length; pi++) idSet[String(w.productNos[pi])] = true;
+            }
+          }
+        }
+        if (state.categoryMenu && state.categoryMenu.firstCategories) {
+          var cats = state.categoryMenu.firstCategories;
+          for (var ci = 0; ci < cats.length; ci++) {
+            if (cats[ci].mappingConfig && cats[ci].mappingConfig.mappingType === 'PRODUCT') {
+              var ids = (cats[ci].mappingConfig.mappingContent || '').split('|');
+              for (var mi = 0; mi < ids.length; mi++) if (ids[mi]) idSet[ids[mi]] = true;
+            }
+          }
+        }
+        var links = document.querySelectorAll('a[href*="/products/"]');
+        for (var li = 0; li < links.length; li++) {
+          var m = (links[li].getAttribute('href') || '').match(/products\/(\d+)/);
+          if (m) idSet[m[1]] = true;
+        }
         out.allIds = Object.keys(idSet);
-      } catch (_) {}
-
+      } catch(e) {}
       return out;
     });
 
     result.channel_uid = stateInfo.channelUid;
+    result.debug.totalIds = stateInfo.allIds.length;
 
+    // ===== PHASE 2: simple-products API + channelProductNo 추출 =====
+    var productMap = {};
+    var channelProductMap = {};
     if (stateInfo.channelUid && stateInfo.allIds.length > 0) {
-      const batchSize = 20;
+      var batchSize = 20;
+      for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
+        var batch = stateInfo.allIds.slice(bi, bi + batchSize);
+        try {
+          var apiResult = await page.evaluate(function(args) {
+            var params = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
+            return fetch('https://brand.naver.com/n/v2/channels/' + args.uid + '/simple-products?' + params + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true', { credentials: 'include' })
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .catch(function() { return null; });
+          }, { uid: stateInfo.channelUid, ids: batch });
 
-      for (let i = 0; i < stateInfo.allIds.length; i += batchSize) {
-        const batch = stateInfo.allIds.slice(i, i + batchSize);
+          if (Array.isArray(apiResult)) {
+            for (var ai = 0; ai < apiResult.length; ai++) {
+              var p = apiResult[ai];
+              var pid = String(p.id || '');
+              if (!pid) continue;
+              var rc = 0;
+              if (p.reviewAmount && typeof p.reviewAmount === 'object') rc = p.reviewAmount.totalReviewCount || 0;
+              var dp = null;
+              if (p.benefitsView && p.benefitsView.discountedSalePrice) dp = p.benefitsView.discountedSalePrice;
 
-        const apiResult = await page.evaluate(async (args) => {
-          const q = args.ids.map((id) => `ids[]=${id}`).join('&');
-          const url = `${args.apiRoot}${args.uid}/simple-products?${q}`;
-          const res = await fetch(url, { credentials: 'include' }).catch(() => null);
-          return res && res.ok ? await res.json().catch(() => null) : null;
-        }, {
-          uid: stateInfo.channelUid,
-          ids: batch,
-          apiRoot,
-        });
+              // channelProductNo 추출 (marketing-message API에서 사용)
+              var cpn = String(p.channelProductNo || p.channelProductId || '');
 
-        if (!Array.isArray(apiResult)) continue;
+              productMap[pid] = {
+                product_id: pid,
+                channel_product_no: cpn,
+                product_name: p.name || p.dispName || '',
+                sale_price: p.salePrice || 0,
+                discount_price: dp,
+                review_count: rc,
+                purchase_count: 0,
+                purchase_text: '',
+                product_image_url: (p.representativeImageUrl || '').split('?')[0],
+                category_name: p.category ? (p.category.wholeCategoryName || '') : '',
+                is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
+                product_url: baseUrl + '/products/' + pid
+              };
 
-        for (const p of apiResult) {
-          const pid = String(p.id || '');
-          if (!pid) continue;
+              if (cpn) channelProductMap[pid] = cpn;
 
-          let reviewCount = 0;
-          if (p.reviewAmount && typeof p.reviewAmount === 'object') {
-            reviewCount = p.reviewAmount.totalReviewCount || 0;
+              // 첫 상품의 전체 키 덤프 (디버그)
+              if (ai === 0 && bi === 0) {
+                result.debug.firstProductKeys = Object.keys(p).slice(0, 50);
+                // ID 관련 필드 모두
+                var idFields = {};
+                var pKeys = Object.keys(p);
+                for (var pk = 0; pk < pKeys.length; pk++) {
+                  var key = pKeys[pk];
+                  var lower = key.toLowerCase();
+                  if (lower.indexOf('id') > -1 || lower.indexOf('no') > -1 ||
+                      lower.indexOf('channel') > -1 || lower.indexOf('product') > -1) {
+                    var val = p[key];
+                    idFields[key] = typeof val === 'object' ? JSON.stringify(val).slice(0, 100) : val;
+                  }
+                }
+                result.debug.firstProductIdFields = idFields;
+              }
+            }
           }
-
-          const discountPrice =
-            p.benefitsView && p.benefitsView.discountedSalePrice
-              ? p.benefitsView.discountedSalePrice
-              : null;
-
-          productMap[pid] = {
-            product_id: pid,
-            product_name: p.name || p.dispName || '',
-            sale_price: p.salePrice || 0,
-            discount_price: discountPrice,
-            review_count: reviewCount,
-            purchase_count: 0,
-            total_purchase_count: 0,
-            product_image_url: (p.representativeImageUrl || '').split('?')[0],
-            category_name: p.category ? p.category.wholeCategoryName || '' : '',
-            is_sold_out:
-              p.productStatusType === 'OUTOFSTOCK' || p.soldout === true || false,
-            product_url: `${baseUrl}/products/${pid}`,
-            debug_purchase_source: '',
-            debug_purchase_matches: [],
-          };
-        }
+        } catch(e) {}
+        if (bi + batchSize < stateInfo.allIds.length) await page.waitForTimeout(200);
       }
     }
+    result.debug.apiProducts = Object.keys(productMap).length;
+    result.debug.channelProductMapped = Object.keys(channelProductMap).length;
 
-    const pids = Object.keys(productMap);
-    result.debug.fetch.total = pids.length;
+    // ===== PHASE 3: marketing-message API로 구매건수 가져오기 =====
+    var purchaseDebug = { total: 0, success: 0, withPurchase: 0, errors: [], sampleResponses: [] };
 
-    const concurrency = Math.max(1, Math.min(4, Number(params.product_concurrency || 2)));
+    var allPids = Object.keys(productMap);
+    console.log('[v18] P3: fetching marketing-message for ' + allPids.length + ' products');
 
-    for (let i = 0; i < pids.length; i += concurrency) {
-      const batch = pids.slice(i, i + concurrency);
+    for (var mi = 0; mi < allPids.length; mi++) {
+      var prodId = allPids[mi];
+      var prod = productMap[prodId];
+      // marketing-message ID로 channelProductNo 사용, 없으면 원래 product_id
+      var msgId = prod.channel_product_no || prodId;
 
-      const batchResults = await Promise.all(
-        batch.map(async (id) => {
-          const counts = await collectProductCounts(context, productMap[id].product_url).catch(() => ({
-            recent: 0,
-            cumul: 0,
-            purchase: 0,
-            matchedSources: [],
-            matches: [],
-          }));
-          return { id, counts };
-        })
-      );
+      try {
+        var msgResult = await page.evaluate(function(args) {
+          var url = 'https://brand.naver.com/n/v1/marketing-message/' + args.id
+            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=1';
+          return fetch(url, { credentials: 'include' })
+            .then(function(r) {
+              if (!r.ok) return { ok: false, status: r.status };
+              return r.json().then(function(data) {
+                return { ok: true, data: data };
+              });
+            })
+            .catch(function(err) {
+              return { ok: false, error: err.message || String(err) };
+            });
+        }, { id: msgId });
 
-      for (const { id, counts } of batchResults) {
-        const recent = counts.recent || 0;
-        const cumul = counts.cumul || 0;
-        const purchase = counts.purchase || 0;
+        purchaseDebug.total++;
 
-        productMap[id].purchase_count = recent || purchase || 0;
-        productMap[id].total_purchase_count = cumul || purchase || recent || 0;
-        productMap[id].debug_purchase_source = (counts.matchedSources || []).join(' | ');
-        productMap[id].debug_purchase_matches = counts.matches || [];
+        if (msgResult && msgResult.ok && msgResult.data) {
+          purchaseDebug.success++;
+          var phrase = msgResult.data.mainPhrase || '';
+          prod.purchase_text = phrase;
 
-        if (recent || cumul || purchase) {
-          result.debug.fetch.success++;
-          if (!recent && (purchase || cumul)) result.debug.fetch.fallbackDomUsed++;
+          // "9명 이상 구매" -> 9
+          var count = 0;
+          var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
+          if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
+          prod.purchase_count = count;
+
+          if (count > 0) purchaseDebug.withPurchase++;
+
+          // 처음 5개 샘플 저장
+          if (purchaseDebug.sampleResponses.length < 5) {
+            purchaseDebug.sampleResponses.push({
+              productId: prodId,
+              msgId: msgId,
+              phrase: phrase,
+              count: count
+            });
+          }
+        } else {
+          if (purchaseDebug.errors.length < 3) {
+            purchaseDebug.errors.push({
+              productId: prodId,
+              msgId: msgId,
+              status: msgResult ? msgResult.status : 'null',
+              error: msgResult ? msgResult.error : 'null'
+            });
+          }
+        }
+      } catch(e) {
+        if (purchaseDebug.errors.length < 3) {
+          purchaseDebug.errors.push({ productId: prodId, error: e.message || String(e) });
         }
       }
+
+      // Rate limit: 10개마다 200ms 대기
+      if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
     }
 
-    result.data = pids.map((pid) => productMap[pid]);
+    result.debug.purchase = purchaseDebug;
+    console.log('[v18] P3: ' + purchaseDebug.success + '/' + purchaseDebug.total + ' success, ' + purchaseDebug.withPurchase + ' with purchase');
+
+    // ===== PHASE 4: 결과 조립 =====
+    var pids = Object.keys(productMap);
+    for (var fi = 0; fi < pids.length; fi++) {
+      var prod2 = productMap[pids[fi]];
+      result.data.push({
+        product_id: prod2.product_id,
+        product_name: prod2.product_name,
+        sale_price: prod2.sale_price,
+        discount_price: prod2.discount_price,
+        review_count: prod2.review_count,
+        purchase_count: prod2.purchase_count,
+        purchase_text: prod2.purchase_text,
+        product_image_url: prod2.product_image_url,
+        category_name: prod2.category_name,
+        is_sold_out: prod2.is_sold_out,
+        product_url: prod2.product_url
+      });
+    }
+
     result.debug.total = result.data.length;
-    result.debug.withPurchase = result.data.filter(
-      (x) => x.purchase_count > 0 || x.total_purchase_count > 0
-    ).length;
+    result.debug.withPurchase = purchaseDebug.withPurchase;
 
-    if (result.data.length === 0) {
-      result.status = 'EMPTY';
-      result.error = 'No products found';
-    }
+    if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
   } catch (e) {
     result.status = 'ERROR';
     result.error = e.message || String(e);
   } finally {
-    if (page) await page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
-    if (browser) await browser.close().catch(() => {});
+    await page.close();
+    await ctx.close();
   }
-
   return result;
 }
 
-async function execute(action, req, res) {
-  if (action === 'scrape') {
-    return res.json(await scrape(req.body));
-  }
-
-  return res.status(400).json({
-    status: 'ERROR',
-    message: `Unknown action: ${action}`,
+// ============ SPY ============
+async function spy(params) {
+  var url = params.url || 'https://brand.naver.com/dcurvin/products/12569074482';
+  var br = await getBrowser();
+  var ctx = await br.newContext(ctxOpts());
+  var page = await ctx.newPage();
+  var captured = [];
+  page.on('response', async function(response) {
+    try {
+      var reqUrl = response.url();
+      var ct = response.headers()['content-type'] || '';
+      if (ct.indexOf('json') > -1 && response.status() === 200) {
+        var body = await response.text();
+        captured.push({
+          url: reqUrl.length > 200 ? reqUrl.slice(0, 200) + '...' : reqUrl,
+          status: response.status(), size: body.length,
+          keys: (function() { try { return Object.keys(JSON.parse(body)).slice(0, 20); } catch(e) { return []; } })(),
+          has_purchase: body.indexOf('urchase') > -1 || body.indexOf('saleCount') > -1 || body.indexOf('\uAD6C\uB9E4') > -1,
+          snippet: body.slice(0, 500)
+        });
+      }
+    } catch(e) {}
   });
+  try {
+    await page.addInitScript(stealth);
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    await page.waitForTimeout(3000);
+    return { status: 'OK', url: url, captured_count: captured.length, captured: captured };
+  } catch(e) {
+    return { status: 'ERROR', error: e.message, captured: captured };
+  } finally {
+    await page.close();
+    await ctx.close();
+  }
 }
 
-module.exports = { execute, scrape };
+async function execute(action, req, res) {
+  console.log('[naver_store] action=' + action);
+  if (action === 'scrape') return res.json(await scrape(req.body));
+  if (action === 'spy') return res.json(await spy(req.body));
+  return res.status(400).json({ status: 'ERROR', message: 'Unknown action: ' + action });
+}
+
+module.exports = { execute };
