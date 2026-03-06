@@ -16,7 +16,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v24: Extension Logic (Sequential Single Tab + Deep Extract) ============
+// ============ SCRAPE v25: Extension Deep Scan Logic (No-Quote Regex & Recursive) ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -39,7 +39,7 @@ async function scrape(params) {
   var productMap = {};
 
   try {
-    console.log('[v24] Starting Browser...');
+    console.log('[v25] Starting Browser...');
     br1 = await chromium.launch({
       headless: true,
       proxy: proxy,
@@ -56,18 +56,18 @@ async function scrape(params) {
     page1 = await ctx1.newPage();
     await page1.addInitScript(stealth);
 
-    // ===== PHASE 1: 스토어 접속하여 안전한 세션(쿠키) 획득 및 기본 상품 리스트 파싱 =====
+    // ===== PHASE 1: 스토어 메인 접속 및 상품 기본 정보 추출 =====
     var domainRoot = storeType === 'brand' ? 'https://brand.naver.com' : 'https://smartstore.naver.com';
     var baseUrl = domainRoot + '/' + storeSlug;
     var apiRoot = storeType === 'brand' ? 'https://brand.naver.com/n/v2/channels/' : 'https://smartstore.naver.com/i/v1/channels/';
 
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v24] P1: Navigating to Store: ' + targetUrl);
+    console.log('[v25] P1: Navigating to Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page1.waitForTimeout(3000); 
 
-    // 스크롤하여 봇 아님을 증명
+    // 스크롤 (봇 회피 및 페이지 로딩 트리거)
     var prevHeight = 0;
     for (var si = 0; si < 3; si++) {
       await page1.evaluate(function() { window.scrollTo(0, document.body.scrollHeight); });
@@ -98,7 +98,6 @@ async function scrape(params) {
 
     result.channel_uid = stateInfo.channelUid;
 
-    // 상품 목록의 가격/썸네일 등 기본 정보 가져오기
     if (stateInfo.channelUid && stateInfo.allIds.length > 0) {
       var batchSize = 20;
       for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
@@ -140,77 +139,99 @@ async function scrape(params) {
       }
     }
 
-    // ===== PHASE 2: 확장 프로그램 방식 (동일 탭으로 상품페이지 순차 방문) =====
-    console.log('[v24] P2: Sequentially visiting product pages to prevent WAF block...');
+    // ===== PHASE 2: 확장 프로그램 완벽 빙의 (딥 스캔 XHR 통신) =====
+    console.log('[v25] P2: Deep scanning product pages for hidden sales data...');
     var pids = Object.keys(productMap);
-    result.debug.fetch = { total: pids.length, success: 0, blocked: 0 };
+    var fetchBatchSize = 4; // 너무 빠르면 막히므로 4개씩
+    
+    result.debug.fetch = { total: pids.length, success: 0 };
 
-    for (var i = 0; i < pids.length; i++) {
-      var pid = pids[i];
-      var prodUrl = productMap[pid].product_url;
+    for (var i = 0; i < pids.length; i += fetchBatchSize) {
+      var fetchBatch = pids.slice(i, i + fetchBatchSize);
       
-      try {
-        // 이미 1단계에서 네이버 방어벽을 뚫은 page1을 그대로 활용하여 상품 페이지로 이동
-        await page1.goto(prodUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // 현재 브라우저 페이지(page1) 안에서 fetch를 실행하여 소스코드를 뜯어옴 (WAF 통과된 상태 활용)
+      var countsResult = await page1.evaluate(async function(args) {
+        var results = {};
         
-        // 페이지가 정상적으로 로드될 때까지 약간 대기 (사람 흉내)
-        await page1.waitForTimeout(1000 + Math.random() * 1000);
+        for (var j = 0; j < args.ids.length; j++) {
+          var id = args.ids[j];
+          try {
+            var r = await fetch(args.baseUrl + '/products/' + id);
+            if (r.ok) {
+              var text = await r.text();
+              var recent = 0;
+              var cumul = 0;
+              
+              // [핵심 1] 따옴표 없는 변수명까지 모조리 잡아내는 '확장 프로그램식' 포괄적 정규식
+              // recentSaleCount : 15  또는 "recentSaleCount":15 모두 매칭
+              var rRegex = /recentSaleCount["']?\s*:\s*(\d+)/g;
+              var cRegex = /(?:cumulationSaleCount|totalSaleCount|purchaseCount|purchaseCnt)["']?\s*:\s*(\d+)/g;
+              
+              var rMatch;
+              while ((rMatch = rRegex.exec(text)) !== null) {
+                  recent = Math.max(recent, parseInt(rMatch[1], 10));
+              }
+              
+              var cMatch;
+              while ((cMatch = cRegex.exec(text)) !== null) {
+                  cumul = Math.max(cumul, parseInt(cMatch[1], 10));
+              }
 
-        // 방어벽(CAPTCHA 등)에 막혔는지 타이틀로 검사
-        var pageTitle = await page1.title();
-        if (pageTitle.includes('접근방어') || pageTitle.includes('DataDome') || pageTitle.includes('로봇')) {
-            console.log('[v24] WAF Blocked on product: ' + pid);
-            result.debug.fetch.blocked++;
-            await page1.waitForTimeout(5000); // 막히면 잠시 멈춤
-            continue;
-        }
-
-        // 1. 네이버 스토어 전역 객체(window.__PRELOADED_STATE__)에서 확장프로그램처럼 직접 데이터 추출 시도
-        var salesData = await page1.evaluate(function() {
-            try {
-                if (window.__PRELOADED_STATE__ && window.__PRELOADED_STATE__.product && window.__PRELOADED_STATE__.product.A) {
-                    var s = window.__PRELOADED_STATE__.product.A.saleAmount;
-                    if (s) {
-                        return { 
-                            recent: parseInt(s.recentSaleCount || 0, 10), 
-                            cumul: parseInt(s.cumulationSaleCount || s.totalSaleCount || 0, 10) 
-                        };
-                    }
-                }
-            } catch(e) {}
-            return null;
-        });
-
-        // 2. 만약 객체에서 못 찾았다면, HTML 소스코드 정규식으로 이중 검색 (백업 플랜)
-        if (!salesData || (salesData.recent === 0 && salesData.cumul === 0)) {
-            var htmlContent = await page1.content();
-            var recentMatch = htmlContent.match(/"recentSaleCount"\s*:\s*(\d+)/) || htmlContent.match(/"purchaseCount"\s*:\s*(\d+)/);
-            var cumulMatch = htmlContent.match(/"cumulationSaleCount"\s*:\s*(\d+)/) || htmlContent.match(/"totalSaleCount"\s*:\s*(\d+)/);
-            
-            salesData = {
-                recent: recentMatch ? parseInt(recentMatch[1], 10) : 0,
-                cumul: cumulMatch ? parseInt(cumulMatch[1], 10) : 0
-            };
-        }
-
-        // 데이터 매핑
-        if (salesData) {
-            productMap[pid].purchase_count = salesData.recent > 0 ? salesData.recent : salesData.cumul;
-            productMap[pid].total_purchase_count = salesData.cumul;
-
-            if (salesData.recent > 0 || salesData.cumul > 0) {
-                result.debug.fetch.success++;
-                console.log(`[v24] Success ID: ${pid} / Recent: ${salesData.recent} / Cumul: ${salesData.cumul}`);
+              // [핵심 2] 혹시라도 정규식으로 못 찾았을 경우, 상태 객체를 직접 파싱하여 재귀 탐색 (백업)
+              if (recent === 0 && cumul === 0) {
+                  var stateMatch = text.match(/window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})(?=<\/script>|;window)/s);
+                  if (stateMatch) {
+                      try {
+                          var stateObj = JSON.parse(stateMatch[1]);
+                          
+                          // 전체 객체를 돌면서 키값에 sale이 포함된 숫자를 다 찾음
+                          function searchObj(obj) {
+                              if (!obj || typeof obj !== 'object') return;
+                              if (Array.isArray(obj)) {
+                                  obj.forEach(searchObj);
+                                  return;
+                              }
+                              if (obj.recentSaleCount !== undefined) recent = Math.max(recent, parseInt(obj.recentSaleCount) || 0);
+                              if (obj.cumulationSaleCount !== undefined) cumul = Math.max(cumul, parseInt(obj.cumulationSaleCount) || 0);
+                              if (obj.totalSaleCount !== undefined) cumul = Math.max(cumul, parseInt(obj.totalSaleCount) || 0);
+                              
+                              for (var key in obj) {
+                                  if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                                      searchObj(obj[key]);
+                                  }
+                              }
+                          }
+                          searchObj(stateObj);
+                      } catch(parseErr) {}
+                  }
+              }
+              
+              results[id] = { recent: recent, cumul: cumul };
             }
+          } catch(e) {}
         }
+        return results;
+      }, { ids: fetchBatch, baseUrl: baseUrl });
 
-      } catch(err) {
-        console.log('[v24] Error on product ' + pid + ': ' + err.message);
+      // 결과 매핑
+      for (var id in countsResult) {
+        var c = countsResult[id];
+        // 최근 판매건수 우선, 없으면 누적 판매건수를 purchase_count에 대입
+        productMap[id].purchase_count = c.recent > 0 ? c.recent : c.cumul;
+        productMap[id].total_purchase_count = c.cumul;
+        
+        if (c.recent > 0 || c.cumul > 0) {
+          result.debug.fetch.success++;
+        }
+      }
+      
+      if (i + fetchBatchSize < pids.length) {
+        await page1.waitForTimeout(1000); // 디도스 방지 딜레이
       }
     }
 
     // ===== PHASE 3: 최종 데이터 포맷팅 =====
-    result.method_used = 'sequential_single_tab_extraction_v24';
+    result.method_used = 'extension_deep_scan_v25';
     for (var fi = 0; fi < pids.length; fi++) {
       result.data.push(productMap[pids[fi]]);
     }
