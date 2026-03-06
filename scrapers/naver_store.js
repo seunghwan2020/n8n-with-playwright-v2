@@ -52,8 +52,8 @@ async function debug(params) {
 async function getProductDetail(page, productUrl) {
   var detail = { purchase_count: 0, discount_price: null, category_name: '' };
   try {
-    await page.goto(productUrl, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(1500);
+    await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(500);
 
     detail = await page.evaluate(function() {
       var out = { purchase_count: 0, discount_price: null, category_name: '' };
@@ -206,7 +206,7 @@ async function scrape(params) {
 
         // 상품 간 딜레이 (봇 감지 방지)
         if (d < filtered.length - 1) {
-          await page.waitForTimeout(1500 + Math.floor(Math.random() * 1000));
+          await page.waitForTimeout(500 + Math.floor(Math.random() * 500));
         }
       }
     }
