@@ -16,7 +16,7 @@ var stealth = function() {
   Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3]; } });
 };
 
-// ============ SCRAPE v22: Fixed API URL & Product Detail Direct Fetch ============
+// ============ SCRAPE v23: Extension Logic via Parallel Tab Navigation ============
 async function scrape(params) {
   var storeSlug = params.store_slug;
   var storeType = params.store_type || 'brand';
@@ -39,7 +39,7 @@ async function scrape(params) {
   var productMap = {};
 
   try {
-    console.log('[v22] Starting Browser...');
+    console.log('[v23] Starting Browser...');
     br1 = await chromium.launch({
       headless: true,
       proxy: proxy,
@@ -57,13 +57,12 @@ async function scrape(params) {
     await page1.addInitScript(stealth);
 
     // ===== PHASE 1: 브랜드 스토어 접속 및 기본 데이터 파싱 =====
-    // URL 생성 규칙 수정 (오류 원인 해결)
     var domainRoot = storeType === 'brand' ? 'https://brand.naver.com' : 'https://smartstore.naver.com';
     var baseUrl = domainRoot + '/' + storeSlug;
     var apiRoot = storeType === 'brand' ? 'https://brand.naver.com/n/v2/channels/' : 'https://smartstore.naver.com/i/v1/channels/';
 
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v22] P1: Navigating to Store: ' + targetUrl);
+    console.log('[v23] P1: Navigating to Store: ' + targetUrl);
     
     await page1.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page1.waitForTimeout(3000); 
@@ -105,7 +104,6 @@ async function scrape(params) {
         try {
           var apiResult = await page1.evaluate(function(args) {
             var params = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-            // 정상적인 API 루트로 호출하도록 수정됨
             return fetch(args.apiRoot + args.uid + '/simple-products?' + params, { credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
@@ -140,60 +138,84 @@ async function scrape(params) {
       }
     }
 
-    // ===== PHASE 2: 상품 개별 페이지 직접 파싱 (WAF 우회 및 정확도 100%) =====
-    console.log('[v22] P2: Fetching individual product pages to extract purchase counts...');
+    // ===== PHASE 2: 확장 프로그램과 동일한 탭 오픈 방식 (초고속 병렬 처리) =====
+    console.log('[v23] P2: Fetching individual product pages via parallel background tabs...');
     var pids = Object.keys(productMap);
-    var fetchBatchSize = 5; // 한 번에 5개씩만 통신하여 봇 탐지 회피
+    var fetchBatchSize = 5; // 한 번에 5개의 탭을 동시 실행
     
     result.debug.fetch = { total: pids.length, success: 0 };
 
     for (var i = 0; i < pids.length; i += fetchBatchSize) {
       var fetchBatch = pids.slice(i, i + fetchBatchSize);
       
-      var countsResult = await page1.evaluate(async function(args) {
-        var results = {};
-        for (var j = 0; j < args.ids.length; j++) {
-          var id = args.ids[j];
-          try {
-            // 상품 상세페이지 HTML 직접 호출
-            var r = await fetch(args.baseUrl + '/products/' + id);
-            if (r.ok) {
-              var text = await r.text();
-              var recent = 0;
-              var cumul = 0;
-              
-              // 다양한 구매건수 변수명을 아우르는 정규식
+      var promises = fetchBatch.map(async function(id) {
+        var prodPage = null;
+        try {
+          prodPage = await ctx1.newPage();
+          await prodPage.addInitScript(stealth);
+          
+          // 핵심: 무거운 이미지, 폰트, CSS 차단으로 페이지 로딩을 0.5초 이내로 단축
+          await prodPage.route('**/*', function(route) {
+            var type = route.request().resourceType();
+            if (type === 'image' || type === 'stylesheet' || type === 'font' || type === 'media') {
+              route.abort();
+            } else {
+              route.continue();
+            }
+          });
+
+          var prodUrl = baseUrl + '/products/' + id;
+          await prodPage.goto(prodUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+          // 스마트스토어 전역 객체(상태값)에서 확장 프로그램처럼 정확한 데이터 뽑기
+          var salesData = await prodPage.evaluate(function() {
+            var recent = 0;
+            var cumul = 0;
+            try {
+              if (window.__PRELOADED_STATE__ && window.__PRELOADED_STATE__.product && window.__PRELOADED_STATE__.product.A) {
+                var s = window.__PRELOADED_STATE__.product.A.saleAmount;
+                if (s) {
+                  return { recent: s.recentSaleCount || 0, cumul: s.cumulationSaleCount || 0 };
+                }
+              }
+            } catch(e) {}
+
+            // 데이터 객체가 없을 경우를 대비한 정규식 백업
+            try {
+              var text = document.documentElement.innerHTML;
               var rm = text.match(/"recentSaleCount"\s*:\s*(\d+)/) || text.match(/"purchaseCount"\s*:\s*(\d+)/);
               if (rm) recent = parseInt(rm[1], 10);
-              
               var cm = text.match(/"cumulationSaleCount"\s*:\s*(\d+)/) || text.match(/"totalSaleCount"\s*:\s*(\d+)/);
               if (cm) cumul = parseInt(cm[1], 10);
-              
-              results[id] = { recent: recent, cumul: cumul };
-            }
-          } catch(e) {}
-        }
-        return results;
-      }, { ids: fetchBatch, baseUrl: baseUrl });
+              return { recent: recent, cumul: cumul };
+            } catch(e) {}
 
-      // 결과 병합
-      for (var id in countsResult) {
-        var c = countsResult[id];
-        productMap[id].purchase_count = c.recent > 0 ? c.recent : c.cumul;
-        productMap[id].total_purchase_count = c.cumul;
-        
-        if (c.recent > 0 || c.cumul > 0) {
-          result.debug.fetch.success++;
+            return { recent: 0, cumul: 0 };
+          });
+
+          if (salesData && (salesData.recent > 0 || salesData.cumul > 0)) {
+            // 최근 판매건수가 있으면 우선 사용, 없으면 누적 판매건수 사용
+            productMap[id].purchase_count = salesData.recent > 0 ? salesData.recent : salesData.cumul;
+            productMap[id].total_purchase_count = salesData.cumul;
+            return true;
+          }
+          return false;
+        } catch(err) {
+          return false;
+        } finally {
+          if (prodPage) await prodPage.close().catch(function(){});
         }
-      }
-      
-      if (i + fetchBatchSize < pids.length) {
-        await page1.waitForTimeout(1000); // 서버 부하 방지용 딜레이
+      });
+
+      // 5개씩 병렬 실행 및 결과 합산
+      var batchResults = await Promise.all(promises);
+      for (var r = 0; r < batchResults.length; r++) {
+        if (batchResults[r]) result.debug.fetch.success++;
       }
     }
 
     // ===== PHASE 3: 최종 데이터 포맷팅 =====
-    result.method_used = 'product_page_direct_fetch_v22';
+    result.method_used = 'parallel_tabs_extraction_v23';
     for (var fi = 0; fi < pids.length; fi++) {
       result.data.push(productMap[pids[fi]]);
     }
