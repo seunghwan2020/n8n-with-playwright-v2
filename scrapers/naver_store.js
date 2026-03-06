@@ -1,6 +1,6 @@
 const { chromium } = require('playwright');
 
-console.log('🔥 LOADED FILE: scrapers/naver_store.js / BUILD = DCURVIN_PURCHASE_FIX_V30');
+console.log('🔥 LOADED FILE: scrapers/naver_store.js / BUILD = DCURVIN_PURCHASE_FIX_V31');
 
 function ctxOpts() {
   return {
@@ -57,6 +57,10 @@ function isReviewUrl(url) {
   );
 }
 
+function isMarketingMessageUrl(url) {
+  return String(url || '').toLowerCase().includes('/marketing-message/');
+}
+
 function isAllowedProductUrl(url) {
   const u = String(url || '').toLowerCase();
 
@@ -71,7 +75,7 @@ function isAllowedProductUrl(url) {
   );
 }
 
-function recordCandidate(bucket, kind, value, path, source) {
+function recordCandidate(bucket, kind, value, path, source, rawText) {
   const num = toNum(value);
   if (!num) return;
 
@@ -84,6 +88,7 @@ function recordCandidate(bucket, kind, value, path, source) {
     value: num,
     path: path || '',
     source: source || '',
+    raw: rawText ? String(rawText).slice(0, 160) : '',
   });
 }
 
@@ -103,19 +108,15 @@ function deepScanStrictObject(input, bucket, path = 'root', source = '') {
     const lk = String(k).toLowerCase();
     const nextPath = `${path}.${k}`;
 
-    // 리뷰/본문 계열은 완전 무시
     if (
       lk.includes('review') ||
-      lk.includes('content') ||
-      lk.includes('description') ||
-      lk.includes('summary') ||
-      lk.includes('title') ||
-      lk.includes('message')
+      lk === 'reviewcontent' ||
+      lk === 'content' ||
+      lk === 'description'
     ) {
       continue;
     }
 
-    // 정확한 키만 허용
     if (lk === 'recentsalecount') {
       recordCandidate(bucket, 'recent', v, nextPath, source);
     } else if (
@@ -141,18 +142,60 @@ function deepScanStrictObject(input, bucket, path = 'root', source = '') {
   }
 }
 
+function deepScanMarketingMessage(input, bucket, path = 'root', source = '') {
+  if (input === null || input === undefined) return;
+
+  if (Array.isArray(input)) {
+    input.forEach((v, idx) => {
+      deepScanMarketingMessage(v, bucket, `${path}[${idx}]`, source);
+    });
+    return;
+  }
+
+  if (typeof input === 'string') {
+    const s = input;
+
+    const patterns = [
+      /(\d[\d,]*)\s*명이\s*구매/gi,
+      /(\d[\d,]*)\s*명이\s*구매했/gi,
+      /(\d[\d,]*)\s*개\s*구매/gi,
+      /최근[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|명)[^가-힣]{0,5}구매/gi,
+      /(\d[\d,]*)\s*(?:건|회)\s*구매/gi,
+      /누적[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|건|회|명)/gi,
+      /총[^0-9]{0,20}(\d[\d,]*)[^0-9]{0,10}(?:개|건|회|명)/gi,
+    ];
+
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        recordCandidate(bucket, 'purchase', m[1], path, source, s);
+      }
+    }
+    return;
+  }
+
+  if (typeof input !== 'object') return;
+
+  for (const [k, v] of Object.entries(input)) {
+    const nextPath = `${path}.${k}`;
+    if (typeof v === 'string' || typeof v === 'object') {
+      deepScanMarketingMessage(v, bucket, nextPath, source);
+    }
+  }
+}
+
 function extractUsefulMatches(matches) {
   const uniq = [];
   const seen = new Set();
 
   for (const m of matches) {
-    const key = `${m.kind}|${m.value}|${m.path}|${m.source}`;
+    const key = `${m.kind}|${m.value}|${m.path}|${m.source}|${m.raw}`;
     if (seen.has(key)) continue;
     seen.add(key);
     uniq.push(m);
   }
 
-  return uniq.slice(0, 20);
+  return uniq.slice(0, 30);
 }
 
 async function collectProductCounts(context, productUrl) {
@@ -186,7 +229,12 @@ async function collectProductCounts(context, productUrl) {
       if (/json/.test(contentType)) {
         try {
           const json = JSON.parse(text);
-          deepScanStrictObject(json, bucket, 'response', url);
+
+          if (isMarketingMessageUrl(url)) {
+            deepScanMarketingMessage(json, bucket, 'response', url);
+          } else {
+            deepScanStrictObject(json, bucket, 'response', url);
+          }
         } catch (_) {}
       }
     } catch (_) {}
@@ -194,8 +242,8 @@ async function collectProductCounts(context, productUrl) {
 
   try {
     await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(1800);
 
     const pageData = await page.evaluate(() => {
       let preloaded = null;
@@ -226,13 +274,13 @@ async function collectProductCounts(context, productUrl) {
     recent: bucket.recent || 0,
     cumul: bucket.cumul || 0,
     purchase: bucket.purchase || 0,
-    matchedSources: [...new Set(bucket.responseUrls)].slice(0, 10),
+    matchedSources: [...new Set(bucket.responseUrls)].slice(0, 12),
     matches: extractUsefulMatches(bucket.matches),
   };
 }
 
 async function scrape(params) {
-  console.log('🔥 RUNNING scrape() / BUILD = DCURVIN_PURCHASE_FIX_V30');
+  console.log('🔥 RUNNING scrape() / BUILD = DCURVIN_PURCHASE_FIX_V31');
 
   const storeSlug = params.store_slug;
   const storeType = params.store_type || 'brand';
@@ -242,9 +290,9 @@ async function scrape(params) {
     data: [],
     channel_uid: '',
     error: null,
-    method_used: 'DCURVIN_PURCHASE_FIX_V30',
+    method_used: 'DCURVIN_PURCHASE_FIX_V31',
     debug: {
-      build: 'DCURVIN_PURCHASE_FIX_V30',
+      build: 'DCURVIN_PURCHASE_FIX_V31',
       proxyEnabled: false,
       fetch: {
         total: 0,
