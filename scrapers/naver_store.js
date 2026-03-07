@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v26.2_dual_fetch',
-    debug: { build: 'V26.2_DUAL_FETCH', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v26.3_retry',
+    debug: { build: 'V26.3_RETRY', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -389,7 +389,7 @@ async function scrape(params) {
     // → 대부분 상품 1회 evaluate (2 fetch 동시), 최대 2회 ★★★
     var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v26.2] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v26.3] P3: marketing-message for ' + allPids.length + ' products');
 
     var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
     var msgApiFallback = '/n/v1/marketing-message/';
@@ -411,18 +411,25 @@ async function scrape(params) {
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
 
-      // ★ Step 1: basis=1 과 basis=2를 동시에 호출
+      // ★ Step 1: basis=1 과 basis=2를 동시에 호출 (자동 3회 재시도)
       var bothResults = await page.evaluate(function(args) {
-        function doFetch(basis) {
+        function doFetch(basis, retry) {
+          retry = retry || 0;
           var url = args.apiBase + args.path + args.id
             + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
             + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
           return fetch(url, { credentials: 'include' })
             .then(function(r) {
-              if (!r.ok) return { ok: false, basis: basis, status: r.status };
+              if (!r.ok) {
+                if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
+                return { ok: false, basis: basis, status: r.status };
+              }
               return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
             })
-            .catch(function(e) { return { ok: false, basis: basis, error: String(e) }; });
+            .catch(function(e) {
+              if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
+              return { ok: false, basis: basis, error: String(e) };
+            });
         }
         return Promise.all([doFetch(1), doFetch(2)]);
       }, { id: msgId, apiBase: apiBase, path: msgApiPath });
@@ -430,16 +437,23 @@ async function scrape(params) {
       // smartstore fallback
       if (storeType === 'smartstore' && (!bothResults[0].ok && !bothResults[1].ok)) {
         bothResults = await page.evaluate(function(args) {
-          function doFetch(basis) {
+          function doFetch(basis, retry) {
+            retry = retry || 0;
             var url = args.apiBase + args.path + args.id
               + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
               + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
             return fetch(url, { credentials: 'include' })
               .then(function(r) {
-                if (!r.ok) return { ok: false, basis: basis };
+                if (!r.ok) {
+                  if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
+                  return { ok: false, basis: basis };
+                }
                 return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
               })
-              .catch(function(e) { return { ok: false, basis: basis }; });
+              .catch(function(e) {
+                if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
+                return { ok: false, basis: basis };
+              });
           }
           return Promise.all([doFetch(1), doFetch(2)]);
         }, { id: msgId, apiBase: apiBase, path: msgApiFallback });
@@ -467,15 +481,25 @@ async function scrape(params) {
       if (todayResult && todayResult.count > 1 && !weeklyResult) {
         var exactBasis = todayResult.count + 1;
         var r3 = await page.evaluate(function(args) {
-          var url = args.apiBase + args.path + args.id
-            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
-          return fetch(url, { credentials: 'include' })
-            .then(function(r) {
-              if (!r.ok) return { ok: false };
-              return r.json().then(function(data) { return { ok: true, data: data }; });
-            })
-            .catch(function() { return { ok: false }; });
+          function doFetch(retry) {
+            retry = retry || 0;
+            var url = args.apiBase + args.path + args.id
+              + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+              + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
+            return fetch(url, { credentials: 'include' })
+              .then(function(r) {
+                if (!r.ok) {
+                  if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(retry + 1); });
+                  return { ok: false };
+                }
+                return r.json().then(function(data) { return { ok: true, data: data }; });
+              })
+              .catch(function() {
+                if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(retry + 1); });
+                return { ok: false };
+              });
+          }
+          return doFetch(0);
         }, { id: msgId, apiBase: apiBase, path: msgApiPath, basis: exactBasis });
 
         var p3 = r3.ok ? parseMsgData(r3.data) : null;
@@ -520,7 +544,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v26.2] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
+    console.log('[v26.3] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -577,7 +601,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v26.2] action=' + action);
+  console.log('[naver_store v26.3] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
