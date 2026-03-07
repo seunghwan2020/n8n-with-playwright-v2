@@ -38,8 +38,8 @@ async function scrape(params) {
     data: [],
     channel_uid: '',
     error: null,
-    method_used: 'v20_daily_weekly',
-    debug: { build: 'V20_DAILY_WEEKLY' }
+    method_used: 'v22_prefix_based',
+    debug: { build: 'V22_PREFIX_BASED' }
   };
 
   var br = null;
@@ -58,7 +58,7 @@ async function scrape(params) {
 
     // ===== PHASE 1: 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v20] P1: ' + targetUrl);
+    console.log('[v22] P1: ' + targetUrl);
     await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
@@ -174,11 +174,11 @@ async function scrape(params) {
     var purchaseDebug = { total: 0, todaySuccess: 0, weeklySuccess: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
 
-    console.log('[v20] P3: marketing-message x2 for ' + allPids.length + ' products');
+    console.log('[v22] P3: marketing-message x2 for ' + allPids.length + ' products');
 
     // 호출 함수 (basisRepurchased 파라미터만 다름)
     // basisRepurchased=1: 짧은 기간 (보통 오늘)
-    // basisRepurchased=3: 긴 기간 (보통 최근 1주간)
+    // basisRepurchased=2: 최근 1주간
     async function fetchPurchase(productNoId, basis) {
       try {
         var msgResult = await page.evaluate(function(args) {
@@ -216,22 +216,41 @@ async function scrape(params) {
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
 
-      // 호출 1: basisRepurchased=1 (오늘)
-      var todayResult = await fetchPurchase(msgId, 1);
-      if (todayResult.ok) {
-        productMap[prodId].purchase_count_today = todayResult.count;
-        productMap[prodId].purchase_text_today = todayResult.phrase;
-        productMap[prodId].purchase_prefix_today = todayResult.prefix;
-        purchaseDebug.todaySuccess++;
-      }
+      // 호출 1: basisRepurchased=1, 호출 2: basisRepurchased=2
+      var r1 = await fetchPurchase(msgId, 1);
+      var r2 = await fetchPurchase(msgId, 2);
 
-      // 호출 2: basisRepurchased=3 (주간)
-      var weeklyResult = await fetchPurchase(msgId, 3);
-      if (weeklyResult.ok) {
-        productMap[prodId].purchase_count_weekly = weeklyResult.count;
-        productMap[prodId].purchase_text_weekly = weeklyResult.phrase;
-        productMap[prodId].purchase_prefix_weekly = weeklyResult.prefix;
-        purchaseDebug.weeklySuccess++;
+      // prefix 텍스트 기반으로 today/weekly 분류
+      var allResults = [];
+      if (r1.ok) { allResults.push(r1); purchaseDebug.todaySuccess++; }
+      if (r2.ok) { allResults.push(r2); purchaseDebug.weeklySuccess++; }
+
+      for (var ri = 0; ri < allResults.length; ri++) {
+        var r = allResults[ri];
+        var pfx = (r.prefix || '').trim();
+        var isWeekly = pfx.indexOf('\uCD5C\uADFC') > -1;
+        var isToday = pfx.indexOf('\uC624\uB298') > -1;
+
+        if (isWeekly) {
+          if (r.count >= productMap[prodId].purchase_count_weekly) {
+            productMap[prodId].purchase_count_weekly = r.count;
+            productMap[prodId].purchase_text_weekly = r.phrase;
+            productMap[prodId].purchase_prefix_weekly = pfx;
+          }
+        } else if (isToday || pfx === '') {
+          if (r.count >= productMap[prodId].purchase_count_today) {
+            productMap[prodId].purchase_count_today = r.count;
+            productMap[prodId].purchase_text_today = r.phrase;
+            productMap[prodId].purchase_prefix_today = pfx || '';
+          }
+        } else {
+          // prefix 알 수 없으면 큰 값 = weekly
+          if (r.count >= productMap[prodId].purchase_count_weekly) {
+            productMap[prodId].purchase_count_weekly = r.count;
+            productMap[prodId].purchase_text_weekly = r.phrase;
+            productMap[prodId].purchase_prefix_weekly = pfx;
+          }
+        }
       }
 
       // 디버그 샘플
@@ -254,7 +273,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v20] P3 done: today=' + purchaseDebug.todaySuccess + ', weekly=' + purchaseDebug.weeklySuccess);
+    console.log('[v22] P3 done: today=' + purchaseDebug.todaySuccess + ', weekly=' + purchaseDebug.weeklySuccess);
 
     // ===== PHASE 4: 결과 조립 =====
     var pids = Object.keys(productMap);
