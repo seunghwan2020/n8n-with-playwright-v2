@@ -51,7 +51,9 @@ async function scrape(params) {
     var baseUrl, apiBase;
     if (storeType === 'smartstore') {
       baseUrl = 'https://smartstore.naver.com/' + storeSlug;
-      apiBase = 'https://smartstore.naver.com';
+      // ★ v26.3: smartstore도 API는 brand.naver.com 사용!
+      // 확장프로그램 분석: smartstore.naver.com → 실패, brand.naver.com → 성공
+      apiBase = 'https://brand.naver.com';
     } else {
       baseUrl = 'https://brand.naver.com/' + storeSlug;
       apiBase = 'https://brand.naver.com';
@@ -209,6 +211,22 @@ async function scrape(params) {
     result.debug.page2Ids = page2Ids.length;
     result.debug.stateMethod = stateInfo.method;
 
+    // ★ v26.3: smartstore는 brand.naver.com 페이지를 열어서 API 호출 (CORS 우회)
+    var apiPage = page; // brand store는 그대로 사용
+    if (storeType === 'smartstore' && stateInfo.channelUid) {
+      try {
+        apiPage = await ctx.newPage();
+        await apiPage.addInitScript(stealth);
+        // brand.naver.com의 아무 페이지나 열면 됨 (API만 사용할 거라서)
+        await apiPage.goto('https://brand.naver.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await apiPage.waitForTimeout(1000);
+        console.log('[v26.3] smartstore: opened brand.naver.com API page');
+      } catch(e) {
+        console.log('[v26.3] smartstore: brand page open failed, using original page');
+        apiPage = page; // 실패하면 원래 페이지 사용
+      }
+    }
+
     // ===== PHASE 2: simple-products API =====
     // ★ v25.1: smartstore는 API 경로가 다름 + __PRELOADED_STATE__ fallback
     var productMap = {};
@@ -312,9 +330,7 @@ async function scrape(params) {
     // ★ brand store이거나, smartstore에서 state 추출 실패 시 API 호출
     if (Object.keys(productMap).length === 0 && stateInfo.channelUid && stateInfo.allIds.length > 0) {
       // smartstore는 여러 API 경로 시도
-      var apiPaths = (storeType === 'smartstore')
-        ? ['/i/v2/channels/', '/i/v1/channels/', '/n/v2/channels/']
-        : ['/n/v2/channels/'];
+      var apiPaths = ['/n/v2/channels/'];
 
       var batchSize = 20;
       for (var pathIdx = 0; pathIdx < apiPaths.length; pathIdx++) {
@@ -324,7 +340,7 @@ async function scrape(params) {
         for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
           var batch = stateInfo.allIds.slice(bi, bi + batchSize);
           try {
-            var apiResult = await page.evaluate(function(args) {
+            var apiResult = await apiPage.evaluate(function(args) {
               var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
               var url = args.apiBase + args.path + args.uid + '/simple-products?' + qs
                 + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
@@ -367,7 +383,7 @@ async function scrape(params) {
               }
             }
           } catch(e) {}
-          if (bi + batchSize < stateInfo.allIds.length) await page.waitForTimeout(200);
+          if (bi + batchSize < stateInfo.allIds.length) await apiPage.waitForTimeout(200);
         }
 
         if (pathWorked) {
@@ -391,8 +407,7 @@ async function scrape(params) {
     var allPids = Object.keys(productMap);
     console.log('[v26.3] P3: marketing-message for ' + allPids.length + ' products');
 
-    var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
-    var msgApiFallback = '/n/v1/marketing-message/';
+    var msgApiPath = '/n/v1/marketing-message/';
 
     function parseMsgData(data) {
       if (!data || !data.mainPhrase) return null;
@@ -412,7 +427,7 @@ async function scrape(params) {
       purchaseDebug.total++;
 
       // ★ Step 1: basis=1 과 basis=2를 동시에 호출 (자동 3회 재시도)
-      var bothResults = await page.evaluate(function(args) {
+      var bothResults = await apiPage.evaluate(function(args) {
         function doFetch(basis, retry) {
           retry = retry || 0;
           var url = args.apiBase + args.path + args.id
@@ -433,31 +448,6 @@ async function scrape(params) {
         }
         return Promise.all([doFetch(1), doFetch(2)]);
       }, { id: msgId, apiBase: apiBase, path: msgApiPath });
-
-      // smartstore fallback
-      if (storeType === 'smartstore' && (!bothResults[0].ok && !bothResults[1].ok)) {
-        bothResults = await page.evaluate(function(args) {
-          function doFetch(basis, retry) {
-            retry = retry || 0;
-            var url = args.apiBase + args.path + args.id
-              + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-              + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
-            return fetch(url, { credentials: 'include' })
-              .then(function(r) {
-                if (!r.ok) {
-                  if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
-                  return { ok: false, basis: basis };
-                }
-                return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
-              })
-              .catch(function(e) {
-                if (retry < 2) return new Promise(function(res) { setTimeout(res, 300); }).then(function() { return doFetch(basis, retry + 1); });
-                return { ok: false, basis: basis };
-              });
-          }
-          return Promise.all([doFetch(1), doFetch(2)]);
-        }, { id: msgId, apiBase: apiBase, path: msgApiFallback });
-      }
 
       var r1 = bothResults[0].ok ? parseMsgData(bothResults[0].data) : null;
       var r2 = bothResults[1].ok ? parseMsgData(bothResults[1].data) : null;
@@ -480,7 +470,7 @@ async function scrape(params) {
       // ★ 오늘 count > 1인 경우: basis=(count+1)로 추가 호출 필요
       if (todayResult && todayResult.count > 1 && !weeklyResult) {
         var exactBasis = todayResult.count + 1;
-        var r3 = await page.evaluate(function(args) {
+        var r3 = await apiPage.evaluate(function(args) {
           function doFetch(retry) {
             retry = retry || 0;
             var url = args.apiBase + args.path + args.id
@@ -540,7 +530,7 @@ async function scrape(params) {
       }
 
       // 10개 상품마다 200ms 대기
-      if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
+      if (mi > 0 && mi % 10 === 0) await apiPage.waitForTimeout(200);
     }
 
     result.debug.purchase = purchaseDebug;
@@ -571,6 +561,7 @@ async function scrape(params) {
     result.status = 'ERROR';
     result.error = e.message || String(e);
   } finally {
+    try { if (apiPage && apiPage !== page) await apiPage.close(); } catch(x) {}
     try { if (page) await page.close(); } catch(x) {}
     try { if (ctx) await ctx.close(); } catch(x) {}
   }
