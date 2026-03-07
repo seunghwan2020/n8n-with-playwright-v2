@@ -29,14 +29,14 @@ var stealth = function() {
   window.chrome = { runtime: {} };
 };
 
-// ============ SCRAPE v24: smartstore CORS fix + prefix-based classification ============
+// ============ SCRAPE v25: isCumulative 버그 수정 + smartstore 개선 ============
 async function scrape(params) {
   var storeSlug = params.store_slug || 'dcurvin';
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v24_smartstore_fix',
-    debug: { build: 'V24_SMARTSTORE_FIX', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v25_cumul_fix',
+    debug: { build: 'V25_CUMUL_FIX', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -47,8 +47,7 @@ async function scrape(params) {
     page = await ctx.newPage();
     await page.addInitScript(stealth);
 
-    // ★ 핵심: baseUrl과 apiBase를 스토어 타입에 맞게 설정
-    // smartstore 페이지에서 brand.naver.com API 호출하면 CORS 차단됨!
+    // ★ baseUrl과 apiBase를 스토어 타입에 맞게 설정
     var baseUrl, apiBase;
     if (storeType === 'smartstore') {
       baseUrl = 'https://smartstore.naver.com/' + storeSlug;
@@ -60,9 +59,24 @@ async function scrape(params) {
 
     // ===== PHASE 1: 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v24] P1: ' + targetUrl);
-    await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    console.log('[v25] P1: ' + targetUrl);
+
+    // ★ smartstore는 networkidle 대신 domcontentloaded + 충분한 대기
+    var waitStrategy = (storeType === 'smartstore') ? 'domcontentloaded' : 'networkidle';
+    await page.goto(targetUrl, { waitUntil: waitStrategy, timeout: 45000 });
+    await page.waitForTimeout(3000);
+
+    // ★ smartstore: __NEXT_DATA__ 또는 __PRELOADED_STATE__ 로딩 대기
+    if (storeType === 'smartstore') {
+      try {
+        await page.waitForFunction(function() {
+          return window.__PRELOADED_STATE__ || window.__NEXT_DATA__;
+        }, { timeout: 10000 });
+      } catch(e) {
+        console.log('[v25] smartstore state wait timeout, continuing...');
+      }
+      await page.waitForTimeout(2000);
+    }
 
     for (var si = 0; si < 5; si++) {
       try { await page.evaluate(function() { if (document.body) window.scrollTo(0, document.body.scrollHeight); }); } catch(e) { break; }
@@ -75,7 +89,8 @@ async function scrape(params) {
     try {
       var p2 = await ctx.newPage();
       await p2.addInitScript(stealth);
-      await p2.goto(page2Url, { waitUntil: 'networkidle', timeout: 20000 });
+      await p2.goto(page2Url, { waitUntil: waitStrategy, timeout: 30000 });
+      await p2.waitForTimeout(2000);
       page2Ids = await p2.evaluate(function() {
         var ids = [];
         try {
@@ -94,10 +109,14 @@ async function scrape(params) {
     } catch(e) { /* page 2 실패해도 무시 */ }
 
     var stateInfo = await page.evaluate(function() {
-      var out = { channelUid: '', allIds: [] };
+      var out = { channelUid: '', allIds: [], method: 'none' };
       try {
         var state = window.__PRELOADED_STATE__;
-        if (!state) return out;
+        if (!state) {
+          out.method = 'no_preloaded_state';
+          return out;
+        }
+        out.method = 'preloaded_state';
         if (state.channel && state.channel.channelUid) out.channelUid = state.channel.channelUid;
         var idSet = {};
         if (state.categoryProducts && state.categoryProducts.simpleProducts) {
@@ -122,9 +141,46 @@ async function scrape(params) {
           if (m) idSet[m[1]] = true;
         }
         out.allIds = Object.keys(idSet);
-      } catch(e) {}
+      } catch(e) { out.method = 'error: ' + e.message; }
       return out;
     });
+
+    // ★ smartstore fallback: __PRELOADED_STATE__ 실패 시 DOM에서 직접 추출
+    if (stateInfo.allIds.length === 0 && storeType === 'smartstore') {
+      console.log('[v25] smartstore fallback: DOM scraping');
+      var domInfo = await page.evaluate(function(baseUrl) {
+        var out = { channelUid: '', allIds: [], method: 'dom_fallback' };
+        try {
+          // channelUid를 meta 태그나 스크립트에서 추출 시도
+          var scripts = document.querySelectorAll('script');
+          for (var si = 0; si < scripts.length; si++) {
+            var txt = scripts[si].textContent || '';
+            var uidMatch = txt.match(/"channelUid"\s*:\s*"([^"]+)"/);
+            if (uidMatch) { out.channelUid = uidMatch[1]; break; }
+          }
+          // DOM에서 상품 링크 추출
+          var idSet = {};
+          var links = document.querySelectorAll('a[href*="/products/"]');
+          for (var li = 0; li < links.length; li++) {
+            var m = (links[li].getAttribute('href') || '').match(/products\/(\d+)/);
+            if (m) idSet[m[1]] = true;
+          }
+          // 이미지의 data-* 속성이나 product card에서도 시도
+          var cards = document.querySelectorAll('[data-product-no], [data-nclick*="product"]');
+          for (var ci = 0; ci < cards.length; ci++) {
+            var pno = cards[ci].getAttribute('data-product-no');
+            if (pno) idSet[pno] = true;
+          }
+          out.allIds = Object.keys(idSet);
+        } catch(e) { out.method = 'dom_error: ' + e.message; }
+        return out;
+      }, baseUrl);
+
+      if (domInfo.allIds.length > 0) {
+        stateInfo = domInfo;
+        console.log('[v25] DOM fallback found ' + domInfo.allIds.length + ' products');
+      }
+    }
 
     // page2 ID 합치기
     for (var p2i = 0; p2i < page2Ids.length; p2i++) {
@@ -136,9 +192,9 @@ async function scrape(params) {
     result.channel_uid = stateInfo.channelUid;
     result.debug.totalIds = stateInfo.allIds.length;
     result.debug.page2Ids = page2Ids.length;
+    result.debug.stateMethod = stateInfo.method;
 
     // ===== PHASE 2: simple-products API =====
-    // ★ apiBase를 사용 (brand/smartstore 동적!)
     var productMap = {};
     var productNoMap = {};
 
@@ -149,7 +205,6 @@ async function scrape(params) {
         try {
           var apiResult = await page.evaluate(function(args) {
             var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-            // ★ args.apiBase 사용 — smartstore면 smartstore 도메인!
             var url = args.apiBase + '/n/v2/channels/' + args.uid + '/simple-products?' + qs
               + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
             return fetch(url, { credentials: 'include' })
@@ -192,16 +247,15 @@ async function scrape(params) {
     result.debug.apiProducts = Object.keys(productMap).length;
     result.debug.productNoMapped = Object.keys(productNoMap).length;
 
-    // ===== PHASE 3: marketing-message API (basis=1, basis=2) =====
-    // ★ apiBase 사용!
+    // ===== PHASE 3: marketing-message API =====
+    // ★★★ v25 핵심 수정: prefix 우선 분류 (isCumulative로 무조건 skip하지 않음) ★★★
     var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v24] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v25] P3: marketing-message for ' + allPids.length + ' products');
 
     async function fetchMsg(productNoId, basis) {
       try {
         var msgResult = await page.evaluate(function(args) {
-          // ★ args.apiBase 사용!
           var url = args.apiBase + '/n/v1/marketing-message/' + args.id
             + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
             + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
@@ -219,8 +273,8 @@ async function scrape(params) {
           var count = 0;
           var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
           if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
-          var isCumulative = phrase.indexOf('\uC774\uC0C1') > -1;
-          return { ok: true, count: count, phrase: phrase, prefix: (prefix || '').trim(), isCumulative: isCumulative };
+          var hasIsang = phrase.indexOf('\uC774\uC0C1') > -1;
+          return { ok: true, count: count, phrase: phrase, prefix: (prefix || '').trim(), hasIsang: hasIsang };
         }
         return { ok: false };
       } catch(e) { return { ok: false }; }
@@ -234,10 +288,10 @@ async function scrape(params) {
       var r1 = await fetchMsg(msgId, 1);
       var r2 = await fetchMsg(msgId, 2);
 
-      // ===== prefix 기반 분류 =====
-      // "이상 구매" → 누적, 무시
-      // prefix "오늘" → today
-      // prefix "최근" → weekly
+      // ===== v25: prefix 우선 분류 (이상 여부와 무관하게 prefix로 판단) =====
+      // prefix "오늘" → today (이상 포함해도 OK)
+      // prefix "최근" → weekly (이상 포함해도 OK)
+      // prefix 없고 "이상" 있음 → 누적, 무시
       // prefix 없고 "이상" 없음 → weekly fallback
 
       var allR = [];
@@ -246,28 +300,33 @@ async function scrape(params) {
 
       for (var ri = 0; ri < allR.length; ri++) {
         var r = allR[ri];
-        if (r.isCumulative) { purchaseDebug.ignoredCumul++; continue; }
-
         var pfx = r.prefix;
+
         if (pfx.indexOf('\uC624\uB298') > -1) {
-          // "오늘" → today
+          // prefix에 "오늘" → today (★ "이상" 여부 무관)
           productMap[prodId].purchase_count_today = r.count;
           productMap[prodId].purchase_text_today = r.phrase;
           productMap[prodId].purchase_prefix_today = pfx;
           purchaseDebug.todayCount++;
         } else if (pfx.indexOf('\uCD5C\uADFC') > -1) {
-          // "최근 1주간" → weekly
+          // prefix에 "최근" → weekly (★ "이상" 여부 무관 — 핵심 수정!)
           productMap[prodId].purchase_count_weekly = r.count;
           productMap[prodId].purchase_text_weekly = r.phrase;
           productMap[prodId].purchase_prefix_weekly = pfx;
           purchaseDebug.weeklyCount++;
-        } else if (pfx === '' && !r.isCumulative) {
-          // prefix 없고 "이상" 아닌 정확한 수치 → weekly fallback
-          if (r.count > productMap[prodId].purchase_count_weekly) {
-            productMap[prodId].purchase_count_weekly = r.count;
-            productMap[prodId].purchase_text_weekly = r.phrase;
-            productMap[prodId].purchase_prefix_weekly = 'auto';
-            purchaseDebug.weeklyCount++;
+        } else if (pfx === '' || pfx === undefined) {
+          // prefix 없는 경우
+          if (r.hasIsang) {
+            // "이상" 있고 prefix 없음 → 진짜 누적, 무시
+            purchaseDebug.ignoredCumul++;
+          } else {
+            // "이상" 없고 prefix 없음 → weekly fallback
+            if (r.count > productMap[prodId].purchase_count_weekly) {
+              productMap[prodId].purchase_count_weekly = r.count;
+              productMap[prodId].purchase_text_weekly = r.phrase;
+              productMap[prodId].purchase_prefix_weekly = 'auto';
+              purchaseDebug.weeklyCount++;
+            }
           }
         }
       }
@@ -275,8 +334,8 @@ async function scrape(params) {
       if (purchaseDebug.samples.length < 5) {
         purchaseDebug.samples.push({
           pid: prodId, msgId: msgId,
-          r1: r1.ok ? { pfx: r1.prefix, phrase: r1.phrase, cumul: r1.isCumulative } : 'fail',
-          r2: r2.ok ? { pfx: r2.prefix, phrase: r2.phrase, cumul: r2.isCumulative } : 'fail',
+          r1: r1.ok ? { pfx: r1.prefix, phrase: r1.phrase, isang: r1.hasIsang } : 'fail',
+          r2: r2.ok ? { pfx: r2.prefix, phrase: r2.phrase, isang: r2.hasIsang } : 'fail',
           today: productMap[prodId].purchase_count_today,
           weekly: productMap[prodId].purchase_count_weekly
         });
@@ -290,7 +349,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v24] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
+    console.log('[v25] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -347,7 +406,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v24] action=' + action);
+  console.log('[naver_store v25] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
