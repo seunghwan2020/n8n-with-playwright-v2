@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v25_cumul_fix',
-    debug: { build: 'V25_CUMUL_FIX', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v25.1_smartstore_fix',
+    debug: { build: 'V25.1_SMARTSTORE_FIX', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -195,52 +195,171 @@ async function scrape(params) {
     result.debug.stateMethod = stateInfo.method;
 
     // ===== PHASE 2: simple-products API =====
+    // ★ v25.1: smartstore는 API 경로가 다름 + __PRELOADED_STATE__ fallback
     var productMap = {};
     var productNoMap = {};
 
-    if (stateInfo.channelUid && stateInfo.allIds.length > 0) {
-      var batchSize = 20;
-      for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
-        var batch = stateInfo.allIds.slice(bi, bi + batchSize);
+    // ★ smartstore는 먼저 __PRELOADED_STATE__에서 직접 상품 데이터 추출 시도
+    if (storeType === 'smartstore') {
+      console.log('[v25] smartstore: extracting products from __PRELOADED_STATE__');
+      var stateProducts = await page.evaluate(function(baseUrl) {
+        var out = { products: [], productNoMap: {} };
         try {
-          var apiResult = await page.evaluate(function(args) {
-            var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-            var url = args.apiBase + '/n/v2/channels/' + args.uid + '/simple-products?' + qs
-              + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
-            return fetch(url, { credentials: 'include' })
-              .then(function(r) { return r.ok ? r.json() : null; })
-              .catch(function() { return null; });
-          }, { uid: stateInfo.channelUid, ids: batch, apiBase: apiBase });
+          var state = window.__PRELOADED_STATE__;
+          if (!state) return out;
 
-          if (Array.isArray(apiResult)) {
-            for (var ai = 0; ai < apiResult.length; ai++) {
-              var p = apiResult[ai];
-              var pid = String(p.id || '');
-              if (!pid) continue;
-              var rc = 0;
-              if (p.reviewAmount && typeof p.reviewAmount === 'object') rc = p.reviewAmount.totalReviewCount || 0;
-              var dp = null;
-              if (p.benefitsView && p.benefitsView.discountedSalePrice) dp = p.benefitsView.discountedSalePrice;
-              var pno = String(p.productNo || '');
-              if (pno) productNoMap[pid] = pno;
+          // categoryProducts.simpleProducts에 상품 객체가 있는 경우
+          var sp = (state.categoryProducts && state.categoryProducts.simpleProducts) || [];
+          for (var i = 0; i < sp.length; i++) {
+            var p = sp[i];
+            if (typeof p !== 'object' || !p) continue;
+            var pid = String(p.id || '');
+            if (!pid) continue;
+            var rc = 0;
+            if (p.reviewAmount && typeof p.reviewAmount === 'object') {
+              rc = p.reviewAmount.totalReviewCount || 0;
+            }
+            var dp = null;
+            if (p.benefitsView && p.benefitsView.discountedSalePrice) {
+              dp = p.benefitsView.discountedSalePrice;
+            }
+            var pno = String(p.productNo || '');
+            if (pno) out.productNoMap[pid] = pno;
+            out.products.push({
+              product_id: pid,
+              product_name: p.name || p.dispName || '',
+              sale_price: p.salePrice || 0,
+              discount_price: dp,
+              review_count: rc,
+              product_image_url: (p.representativeImageUrl || '').split('?')[0],
+              category_name: p.category ? (p.category.wholeCategoryName || '') : '',
+              is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
+              product_url: baseUrl + '/products/' + pid,
+              productNo: pno
+            });
+          }
 
-              productMap[pid] = {
-                product_id: pid,
-                product_name: p.name || p.dispName || '',
-                sale_price: p.salePrice || 0,
-                discount_price: dp,
-                review_count: rc,
-                purchase_count_today: 0, purchase_text_today: '', purchase_prefix_today: '',
-                purchase_count_weekly: 0, purchase_text_weekly: '', purchase_prefix_weekly: '',
-                product_image_url: (p.representativeImageUrl || '').split('?')[0],
-                category_name: p.category ? (p.category.wholeCategoryName || '') : '',
-                is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
-                product_url: baseUrl + '/products/' + pid
-              };
+          // products 객체에서도 시도 (다른 state 구조)
+          if (out.products.length === 0 && state.products) {
+            var pKeys = Object.keys(state.products);
+            for (var pi = 0; pi < pKeys.length; pi++) {
+              var pp = state.products[pKeys[pi]];
+              if (!pp || typeof pp !== 'object') continue;
+              var ppid = String(pp.id || pp.productId || pKeys[pi]);
+              var prc = 0;
+              if (pp.reviewAmount) prc = pp.reviewAmount.totalReviewCount || 0;
+              var pdp = null;
+              if (pp.benefitsView && pp.benefitsView.discountedSalePrice) pdp = pp.benefitsView.discountedSalePrice;
+              var ppno = String(pp.productNo || '');
+              if (ppno) out.productNoMap[ppid] = ppno;
+              out.products.push({
+                product_id: ppid,
+                product_name: pp.name || pp.dispName || '',
+                sale_price: pp.salePrice || 0,
+                discount_price: pdp,
+                review_count: prc,
+                product_image_url: (pp.representativeImageUrl || '').split('?')[0],
+                category_name: '',
+                is_sold_out: (pp.productStatusType === 'OUTOFSTOCK') || (pp.soldout === true) || false,
+                product_url: baseUrl + '/products/' + ppid,
+                productNo: ppno
+              });
             }
           }
         } catch(e) {}
-        if (bi + batchSize < stateInfo.allIds.length) await page.waitForTimeout(200);
+        return out;
+      }, baseUrl);
+
+      console.log('[v25] smartstore state products: ' + stateProducts.products.length);
+
+      if (stateProducts.products.length > 0) {
+        for (var spi = 0; spi < stateProducts.products.length; spi++) {
+          var sp = stateProducts.products[spi];
+          productMap[sp.product_id] = {
+            product_id: sp.product_id,
+            product_name: sp.product_name,
+            sale_price: sp.sale_price,
+            discount_price: sp.discount_price,
+            review_count: sp.review_count,
+            purchase_count_today: 0, purchase_text_today: '', purchase_prefix_today: '',
+            purchase_count_weekly: 0, purchase_text_weekly: '', purchase_prefix_weekly: '',
+            product_image_url: sp.product_image_url,
+            category_name: sp.category_name,
+            is_sold_out: sp.is_sold_out,
+            product_url: sp.product_url
+          };
+          if (sp.productNo) productNoMap[sp.product_id] = sp.productNo;
+        }
+        Object.assign(productNoMap, stateProducts.productNoMap);
+      }
+    }
+
+    // ★ brand store이거나, smartstore에서 state 추출 실패 시 API 호출
+    if (Object.keys(productMap).length === 0 && stateInfo.channelUid && stateInfo.allIds.length > 0) {
+      // smartstore는 여러 API 경로 시도
+      var apiPaths = (storeType === 'smartstore')
+        ? ['/i/v2/channels/', '/i/v1/channels/', '/n/v2/channels/']
+        : ['/n/v2/channels/'];
+
+      var batchSize = 20;
+      for (var pathIdx = 0; pathIdx < apiPaths.length; pathIdx++) {
+        var currentPath = apiPaths[pathIdx];
+        var pathWorked = false;
+
+        for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
+          var batch = stateInfo.allIds.slice(bi, bi + batchSize);
+          try {
+            var apiResult = await page.evaluate(function(args) {
+              var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
+              var url = args.apiBase + args.path + args.uid + '/simple-products?' + qs
+                + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
+              return fetch(url, { credentials: 'include' })
+                .then(function(r) { return r.ok ? r.json() : { _failed: true, _status: r.status }; })
+                .catch(function(e) { return { _failed: true, _error: String(e) }; });
+            }, { uid: stateInfo.channelUid, ids: batch, apiBase: apiBase, path: currentPath });
+
+            if (apiResult && apiResult._failed) {
+              console.log('[v25] API path ' + currentPath + ' failed: ' + (apiResult._status || apiResult._error));
+              break; // 이 경로는 실패, 다음 경로 시도
+            }
+
+            if (Array.isArray(apiResult)) {
+              pathWorked = true;
+              for (var ai = 0; ai < apiResult.length; ai++) {
+                var p = apiResult[ai];
+                var pid = String(p.id || '');
+                if (!pid) continue;
+                var rc = 0;
+                if (p.reviewAmount && typeof p.reviewAmount === 'object') rc = p.reviewAmount.totalReviewCount || 0;
+                var dp = null;
+                if (p.benefitsView && p.benefitsView.discountedSalePrice) dp = p.benefitsView.discountedSalePrice;
+                var pno = String(p.productNo || '');
+                if (pno) productNoMap[pid] = pno;
+
+                productMap[pid] = {
+                  product_id: pid,
+                  product_name: p.name || p.dispName || '',
+                  sale_price: p.salePrice || 0,
+                  discount_price: dp,
+                  review_count: rc,
+                  purchase_count_today: 0, purchase_text_today: '', purchase_prefix_today: '',
+                  purchase_count_weekly: 0, purchase_text_weekly: '', purchase_prefix_weekly: '',
+                  product_image_url: (p.representativeImageUrl || '').split('?')[0],
+                  category_name: p.category ? (p.category.wholeCategoryName || '') : '',
+                  is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
+                  product_url: baseUrl + '/products/' + pid
+                };
+              }
+            }
+          } catch(e) {}
+          if (bi + batchSize < stateInfo.allIds.length) await page.waitForTimeout(200);
+        }
+
+        if (pathWorked) {
+          console.log('[v25] API path worked: ' + currentPath + ', products: ' + Object.keys(productMap).length);
+          result.debug.apiPathUsed = currentPath;
+          break;
+        }
       }
     }
 
@@ -253,31 +372,42 @@ async function scrape(params) {
     var allPids = Object.keys(productMap);
     console.log('[v25] P3: marketing-message for ' + allPids.length + ' products');
 
-    async function fetchMsg(productNoId, basis) {
-      try {
-        var msgResult = await page.evaluate(function(args) {
-          var url = args.apiBase + '/n/v1/marketing-message/' + args.id
-            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
-          return fetch(url, { credentials: 'include' })
-            .then(function(r) {
-              if (!r.ok) return { ok: false, status: r.status };
-              return r.json().then(function(data) { return { ok: true, data: data }; });
-            })
-            .catch(function(err) { return { ok: false, error: String(err) }; });
-        }, { id: productNoId, basis: basis, apiBase: apiBase });
+    // ★ smartstore용 marketing-message 경로도 다름
+    var msgApiPaths = (storeType === 'smartstore')
+      ? ['/i/v1/marketing-message/', '/n/v1/marketing-message/']
+      : ['/n/v1/marketing-message/'];
+    var msgApiPath = msgApiPaths[0]; // 기본값, 첫 성공 시 고정
 
-        if (msgResult && msgResult.ok && msgResult.data) {
-          var phrase = msgResult.data.mainPhrase || '';
-          var prefix = msgResult.data.prefix || '';
-          var count = 0;
-          var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
-          if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
-          var hasIsang = phrase.indexOf('\uC774\uC0C1') > -1;
-          return { ok: true, count: count, phrase: phrase, prefix: (prefix || '').trim(), hasIsang: hasIsang };
-        }
-        return { ok: false };
-      } catch(e) { return { ok: false }; }
+    async function fetchMsg(productNoId, basis) {
+      for (var mpi = 0; mpi < msgApiPaths.length; mpi++) {
+        var tryPath = (mpi === 0) ? msgApiPath : msgApiPaths[mpi];
+        try {
+          var msgResult = await page.evaluate(function(args) {
+            var url = args.apiBase + args.msgPath + args.id
+              + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+              + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
+            return fetch(url, { credentials: 'include' })
+              .then(function(r) {
+                if (!r.ok) return { ok: false, status: r.status };
+                return r.json().then(function(data) { return { ok: true, data: data }; });
+              })
+              .catch(function(err) { return { ok: false, error: String(err) }; });
+          }, { id: productNoId, basis: basis, apiBase: apiBase, msgPath: tryPath });
+
+          if (msgResult && msgResult.ok && msgResult.data) {
+            msgApiPath = tryPath; // 성공한 경로 기억
+            var phrase = msgResult.data.mainPhrase || '';
+            var prefix = msgResult.data.prefix || '';
+            var count = 0;
+            var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
+            if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
+            var hasIsang = phrase.indexOf('\uC774\uC0C1') > -1;
+            return { ok: true, count: count, phrase: phrase, prefix: (prefix || '').trim(), hasIsang: hasIsang };
+          }
+          // 404/실패 시 다음 경로 시도
+        } catch(e) {}
+      }
+      return { ok: false };
     }
 
     for (var mi = 0; mi < allPids.length; mi++) {
@@ -406,7 +536,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v25] action=' + action);
+  console.log('[naver_store v25.1] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
