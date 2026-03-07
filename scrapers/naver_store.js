@@ -109,7 +109,7 @@ async function scrape(params) {
     } catch(e) { /* page 2 실패해도 무시 */ }
 
     var stateInfo = await page.evaluate(function() {
-      var out = { channelUid: '', allIds: [], method: 'none' };
+      var out = { channelUid: '', channelName: '', allIds: [], method: 'none' };
       try {
         var state = window.__PRELOADED_STATE__;
         if (!state) {
@@ -117,7 +117,11 @@ async function scrape(params) {
           return out;
         }
         out.method = 'preloaded_state';
-        if (state.channel && state.channel.channelUid) out.channelUid = state.channel.channelUid;
+        if (state.channel) {
+          if (state.channel.channelUid) out.channelUid = state.channel.channelUid;
+          // ★ 브랜드명 자동 추출
+          out.channelName = state.channel.channelName || state.channel.displayName || state.channel.name || '';
+        }
         var idSet = {};
         if (state.categoryProducts && state.categoryProducts.simpleProducts) {
           var sp = state.categoryProducts.simpleProducts;
@@ -149,14 +153,23 @@ async function scrape(params) {
     if (stateInfo.allIds.length === 0 && storeType === 'smartstore') {
       console.log('[v25] smartstore fallback: DOM scraping');
       var domInfo = await page.evaluate(function(baseUrl) {
-        var out = { channelUid: '', allIds: [], method: 'dom_fallback' };
+        var out = { channelUid: '', channelName: '', allIds: [], method: 'dom_fallback' };
         try {
-          // channelUid를 meta 태그나 스크립트에서 추출 시도
+          // channelUid, channelName을 스크립트에서 추출 시도
           var scripts = document.querySelectorAll('script');
           for (var si = 0; si < scripts.length; si++) {
             var txt = scripts[si].textContent || '';
             var uidMatch = txt.match(/"channelUid"\s*:\s*"([^"]+)"/);
-            if (uidMatch) { out.channelUid = uidMatch[1]; break; }
+            if (uidMatch && !out.channelUid) out.channelUid = uidMatch[1];
+            var nameMatch = txt.match(/"channelName"\s*:\s*"([^"]+)"/);
+            if (nameMatch && !out.channelName) out.channelName = nameMatch[1];
+            if (out.channelUid && out.channelName) break;
+          }
+          // title 태그에서도 브랜드명 추출 시도
+          if (!out.channelName) {
+            var title = document.title || '';
+            var colonIdx = title.indexOf(':');
+            if (colonIdx > 0) out.channelName = title.substring(0, colonIdx).trim();
           }
           // DOM에서 상품 링크 추출
           var idSet = {};
@@ -178,6 +191,7 @@ async function scrape(params) {
 
       if (domInfo.allIds.length > 0) {
         stateInfo = domInfo;
+        if (domInfo.channelName) result.brand_name = domInfo.channelName;
         console.log('[v25] DOM fallback found ' + domInfo.allIds.length + ' products');
       }
     }
@@ -190,6 +204,7 @@ async function scrape(params) {
     }
 
     result.channel_uid = stateInfo.channelUid;
+    result.brand_name = stateInfo.channelName || '';
     result.debug.totalIds = stateInfo.allIds.length;
     result.debug.page2Ids = page2Ids.length;
     result.debug.stateMethod = stateInfo.method;
