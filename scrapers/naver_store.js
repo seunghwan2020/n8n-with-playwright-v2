@@ -19,8 +19,9 @@ async function getBrowser() {
 
 function ctxOpts() {
   return {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    viewport: { width: 1920, height: 1080 },
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1600, height: 1200 },
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
     extraHTTPHeaders: {
@@ -29,138 +30,180 @@ function ctxOpts() {
   };
 }
 
-var stealth = function () {
-  Object.defineProperty(navigator, 'webdriver', { get: function () { return false; } });
-  Object.defineProperty(navigator, 'plugins', { get: function () { return [1, 2, 3, 4, 5]; } });
-  Object.defineProperty(navigator, 'languages', { get: function () { return ['ko-KR', 'ko', 'en-US', 'en']; } });
+function stealthScript() {
+  Object.defineProperty(navigator, 'webdriver', { get: () => false });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+  Object.defineProperty(navigator, 'languages', {
+    get: () => ['ko-KR', 'ko', 'en-US', 'en']
+  });
   window.chrome = { runtime: {} };
-};
+}
+
+function normalizeText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+function extractCount(text) {
+  const t = normalizeText(text);
+
+  let m = t.match(/(\d[\d,]*)\s*명/);
+  if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+
+  m = t.match(/(\d[\d,]*)\s*건/);
+  if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+
+  m = t.match(/(\d[\d,]*)/);
+  if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+
+  return 0;
+}
+
+function parseMsg(resultObj) {
+  if (!resultObj || !resultObj.ok || !resultObj.data) return null;
+
+  const prefix = normalizeText(resultObj.data.prefix || '');
+  const phrase = normalizeText(resultObj.data.mainPhrase || '');
+  const fullText = normalizeText(prefix + ' ' + phrase);
+
+  let count = extractCount(phrase);
+  if (!count) count = extractCount(fullText);
+
+  return {
+    prefix,
+    phrase,
+    fullText,
+    count,
+    isToday: /오늘/.test(prefix) || /오늘/.test(fullText),
+    isWeekly: /최근\s*1주/.test(prefix) || /최근\s*1주/.test(fullText)
+  };
+}
 
 async function scrape(params) {
-  var storeSlug = params.store_slug || 'dcurvin';
-  var storeType = params.store_type || 'brand';
+  const storeSlug = params.store_slug || 'dcurvin';
+  const storeType = params.store_type || 'brand';
 
-  var result = {
+  const result = {
     status: 'OK',
     data: [],
     channel_uid: '',
     brand_name: '',
     error: null,
-    method_used: 'v28_smartstore_fixed',
+    method_used: 'v29_weekly_debug_hardened',
     debug: {
-      build: 'V28_SMARTSTORE_FIXED',
-      storeSlug: storeSlug,
-      storeType: storeType
+      build: 'V29_WEEKLY_DEBUG_HARDENED',
+      storeSlug,
+      storeType
     }
   };
 
-  var br = null;
-  var ctx = null;
-  var page = null;
+  let br = null;
+  let ctx = null;
+  let page = null;
 
   try {
     br = await getBrowser();
     ctx = await br.newContext(ctxOpts());
     page = await ctx.newPage();
-    await page.addInitScript(stealth);
+    await page.addInitScript(stealthScript);
 
-    var baseUrl, apiBase;
-    if (storeType === 'smartstore') {
-      baseUrl = 'https://smartstore.naver.com/' + storeSlug;
-      apiBase = 'https://smartstore.naver.com';
-    } else {
-      baseUrl = 'https://brand.naver.com/' + storeSlug;
-      apiBase = 'https://brand.naver.com';
-    }
+    const isSmart = storeType === 'smartstore';
+    const baseUrl = isSmart
+      ? `https://smartstore.naver.com/${storeSlug}`
+      : `https://brand.naver.com/${storeSlug}`;
+    const apiBase = isSmart
+      ? 'https://smartstore.naver.com'
+      : 'https://brand.naver.com';
 
-    var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v28] P1 targetUrl = ' + targetUrl);
+    const targetUrl = `${baseUrl}/category/ALL?st=POPULAR&dt=LIST&page=1&size=80`;
+    console.log('[v29] targetUrl =', targetUrl);
 
     await page.goto(targetUrl, {
-      waitUntil: storeType === 'smartstore' ? 'domcontentloaded' : 'networkidle',
+      waitUntil: isSmart ? 'domcontentloaded' : 'networkidle',
       timeout: 45000
     });
 
     await page.waitForTimeout(3500);
 
-    if (storeType === 'smartstore') {
+    if (isSmart) {
       try {
-        await page.waitForFunction(function () {
+        await page.waitForFunction(() => {
           return !!window.__PRELOADED_STATE__ || !!window.__NEXT_DATA__;
-        }, { timeout: 10000 });
+        }, { timeout: 12000 });
       } catch (e) {
-        console.log('[v28] smartstore state wait timeout');
+        console.log('[v29] smartstore state wait timeout');
       }
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
     }
 
-    for (var si = 0; si < 5; si++) {
-      try {
-        await page.evaluate(function () {
-          if (document.body) window.scrollTo(0, document.body.scrollHeight);
-        });
-      } catch (e) {
-        break;
-      }
-      await page.waitForTimeout(1200);
+    for (let i = 0; i < 4; i++) {
+      await page.evaluate(() => {
+        if (document.body) {
+          window.scrollTo(0, document.body.scrollHeight);
+        }
+      });
+      await page.waitForTimeout(1000);
     }
 
     async function extractStateInfo(pageRef, baseUrlRef) {
-      return await pageRef.evaluate(function (baseUrlInner) {
+      return await pageRef.evaluate((baseUrlInner) => {
         function asString(v) {
           return v === null || v === undefined ? '' : String(v);
         }
 
         function pushId(idSet, v) {
-          var s = asString(v);
+          const s = asString(v);
           if (s && /^\d+$/.test(s)) idSet[s] = true;
         }
 
         function walk(obj, visitor, depth) {
-          if (!obj || depth > 8) return;
+          if (!obj || depth > 10) return;
           if (Array.isArray(obj)) {
-            for (var i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
+            for (let i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
             return;
           }
           if (typeof obj !== 'object') return;
           visitor(obj);
-          var keys = Object.keys(obj);
-          for (var k = 0; k < keys.length; k++) {
-            walk(obj[keys[k]], visitor, depth + 1);
+          const keys = Object.keys(obj);
+          for (let i = 0; i < keys.length; i++) {
+            walk(obj[keys[i]], visitor, depth + 1);
           }
         }
 
         function parseNextData() {
           try {
             if (window.__NEXT_DATA__) return window.__NEXT_DATA__;
-            var el = document.getElementById('__NEXT_DATA__');
+            const el = document.getElementById('__NEXT_DATA__');
             if (el && el.textContent) return JSON.parse(el.textContent);
           } catch (e) {}
           return null;
         }
 
-        var out = {
+        const out = {
           channelUid: '',
           channelName: '',
           allIds: [],
           method: 'none'
         };
 
-        var idSet = {};
+        const idSet = {};
 
         try {
-          var pre = window.__PRELOADED_STATE__;
+          const pre = window.__PRELOADED_STATE__;
           if (pre) {
             out.method = 'preloaded_state';
 
             if (pre.channel) {
               out.channelUid = pre.channel.channelUid || pre.channel.id || '';
-              out.channelName = pre.channel.channelName || pre.channel.displayName || pre.channel.name || '';
+              out.channelName =
+                pre.channel.channelName ||
+                pre.channel.displayName ||
+                pre.channel.name ||
+                '';
             }
 
             if (pre.categoryProducts && Array.isArray(pre.categoryProducts.simpleProducts)) {
-              for (var i = 0; i < pre.categoryProducts.simpleProducts.length; i++) {
-                var p = pre.categoryProducts.simpleProducts[i];
+              for (let i = 0; i < pre.categoryProducts.simpleProducts.length; i++) {
+                const p = pre.categoryProducts.simpleProducts[i];
                 if (typeof p === 'object' && p) {
                   pushId(idSet, p.id);
                   pushId(idSet, p.productId);
@@ -171,24 +214,24 @@ async function scrape(params) {
               }
             }
 
-            if (pre.homeSetting && pre.homeSetting.widgets) {
-              var wKeys = Object.keys(pre.homeSetting.widgets);
-              for (var wi = 0; wi < wKeys.length; wi++) {
-                var w = pre.homeSetting.widgets[wKeys[wi]];
-                if (w && Array.isArray(w.productNos)) {
-                  for (var pi = 0; pi < w.productNos.length; pi++) {
-                    pushId(idSet, w.productNos[pi]);
-                  }
+            if (pre.products && typeof pre.products === 'object') {
+              const keys = Object.keys(pre.products);
+              for (let i = 0; i < keys.length; i++) {
+                const p = pre.products[keys[i]];
+                if (p && typeof p === 'object') {
+                  pushId(idSet, p.id);
+                  pushId(idSet, p.productId);
+                  pushId(idSet, p.productNo);
                 }
               }
             }
           }
 
-          var nextData = parseNextData();
+          const nextData = parseNextData();
           if (nextData) {
             if (out.method === 'none') out.method = 'next_data';
 
-            walk(nextData, function (node) {
+            walk(nextData, (node) => {
               if (!out.channelUid) {
                 out.channelUid =
                   node.channelUid ||
@@ -196,6 +239,7 @@ async function scrape(params) {
                   node.channel_id ||
                   '';
               }
+
               if (!out.channelName) {
                 out.channelName =
                   node.channelName ||
@@ -216,101 +260,57 @@ async function scrape(params) {
               }
 
               if (Array.isArray(node.productNos)) {
-                for (var j = 0; j < node.productNos.length; j++) {
-                  pushId(idSet, node.productNos[j]);
+                for (let i = 0; i < node.productNos.length; i++) {
+                  pushId(idSet, node.productNos[i]);
                 }
               }
 
               if (Array.isArray(node.products)) {
-                for (var jj = 0; jj < node.products.length; jj++) {
-                  var pp = node.products[jj];
-                  if (pp && typeof pp === 'object') {
-                    pushId(idSet, pp.id);
-                    pushId(idSet, pp.productId);
-                    pushId(idSet, pp.productNo);
+                for (let i = 0; i < node.products.length; i++) {
+                  const p = node.products[i];
+                  if (p && typeof p === 'object') {
+                    pushId(idSet, p.id);
+                    pushId(idSet, p.productId);
+                    pushId(idSet, p.productNo);
+                  }
+                }
+              }
+
+              if (Array.isArray(node.simpleProducts)) {
+                for (let i = 0; i < node.simpleProducts.length; i++) {
+                  const p = node.simpleProducts[i];
+                  if (p && typeof p === 'object') {
+                    pushId(idSet, p.id);
+                    pushId(idSet, p.productId);
+                    pushId(idSet, p.productNo);
                   }
                 }
               }
             }, 0);
           }
 
-          var links = document.querySelectorAll('a[href*="/products/"]');
-          for (var li = 0; li < links.length; li++) {
-            var href = links[li].getAttribute('href') || '';
-            var m = href.match(/products\/(\d+)/);
+          const links = document.querySelectorAll('a[href*="/products/"]');
+          for (let i = 0; i < links.length; i++) {
+            const href = links[i].getAttribute('href') || '';
+            const m = href.match(/products\/(\d+)/);
             if (m) idSet[m[1]] = true;
           }
 
-          var cards = document.querySelectorAll('[data-product-no], [data-nclick*="product"], [data-shp-contents-id]');
-          for (var ci = 0; ci < cards.length; ci++) {
-            var pno1 = cards[ci].getAttribute('data-product-no');
-            var pno2 = cards[ci].getAttribute('data-shp-contents-id');
-            if (pno1) pushId(idSet, pno1);
-            if (pno2) pushId(idSet, pno2);
-          }
-
-          if (!out.channelName) {
-            var title = document.title || '';
-            if (title) {
-              out.channelName = title.split(':')[0].trim();
-            }
-          }
-
-          if (!out.channelUid) {
-            var scripts = document.querySelectorAll('script');
-            for (var si2 = 0; si2 < scripts.length; si2++) {
-              var txt = scripts[si2].textContent || '';
-              var uidMatch = txt.match(/"channelUid"\s*:\s*"([^"]+)"/);
-              if (uidMatch) {
-                out.channelUid = uidMatch[1];
-                break;
-              }
-            }
+          if (!out.channelName && document.title) {
+            out.channelName = document.title.split(':')[0].trim();
           }
 
           out.allIds = Object.keys(idSet);
         } catch (e) {
-          out.method = 'error:' + e.message;
+          out.method = 'error:' + String(e.message || e);
         }
 
         return out;
       }, baseUrlRef);
     }
 
-    var stateInfo = await extractStateInfo(page, baseUrl);
-
-    var page2Ids = [];
-    try {
-      var p2 = await ctx.newPage();
-      await p2.addInitScript(stealth);
-      await p2.goto(baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=2&size=80', {
-        waitUntil: storeType === 'smartstore' ? 'domcontentloaded' : 'networkidle',
-        timeout: 30000
-      });
-      await p2.waitForTimeout(2500);
-      var page2State = await extractStateInfo(p2, baseUrl);
-      page2Ids = page2State.allIds || [];
-      await p2.close();
-    } catch (e) {}
-
-    for (var p2i = 0; p2i < page2Ids.length; p2i++) {
-      if (stateInfo.allIds.indexOf(page2Ids[p2i]) === -1) {
-        stateInfo.allIds.push(page2Ids[p2i]);
-      }
-    }
-
-    result.channel_uid = stateInfo.channelUid || '';
-    result.brand_name = stateInfo.channelName || '';
-    result.debug.stateMethod = stateInfo.method;
-    result.debug.totalIds = stateInfo.allIds.length;
-    result.debug.page2Ids = page2Ids.length;
-
-    // ===== PHASE 2: 상품 데이터 추출 =====
-    var productMap = {};
-    var productNoMap = {};
-
     async function extractProductsFromState(pageRef, baseUrlRef) {
-      return await pageRef.evaluate(function (baseUrlInner) {
+      return await pageRef.evaluate((baseUrlInner) => {
         function s(v) {
           return v === null || v === undefined ? '' : String(v);
         }
@@ -318,28 +318,43 @@ async function scrape(params) {
         function parseNextData() {
           try {
             if (window.__NEXT_DATA__) return window.__NEXT_DATA__;
-            var el = document.getElementById('__NEXT_DATA__');
+            const el = document.getElementById('__NEXT_DATA__');
             if (el && el.textContent) return JSON.parse(el.textContent);
           } catch (e) {}
           return null;
         }
 
+        function walk(obj, visitor, depth) {
+          if (!obj || depth > 10) return;
+          if (Array.isArray(obj)) {
+            for (let i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
+            return;
+          }
+          if (typeof obj !== 'object') return;
+          visitor(obj);
+          const keys = Object.keys(obj);
+          for (let i = 0; i < keys.length; i++) {
+            walk(obj[keys[i]], visitor, depth + 1);
+          }
+        }
+
         function addProduct(out, raw) {
           if (!raw || typeof raw !== 'object') return;
 
-          var pid = s(raw.id || raw.productId || '');
-          var pno = s(raw.productNo || '');
+          const pid = s(raw.id || raw.productId || '');
+          const pno = s(raw.productNo || '');
           if (!pid && !pno) return;
 
-          var finalId = pid || pno;
-          var reviewCount = 0;
+          const finalId = pid || pno;
+
+          let reviewCount = 0;
           if (raw.reviewAmount && typeof raw.reviewAmount === 'object') {
             reviewCount = raw.reviewAmount.totalReviewCount || 0;
           } else if (raw.reviewCount) {
             reviewCount = raw.reviewCount;
           }
 
-          var discountPrice = null;
+          let discountPrice = null;
           if (raw.benefitsView && raw.benefitsView.discountedSalePrice) {
             discountPrice = raw.benefitsView.discountedSalePrice;
           } else if (raw.discountedSalePrice) {
@@ -352,8 +367,12 @@ async function scrape(params) {
             sale_price: raw.salePrice || raw.salePriceValue || 0,
             discount_price: discountPrice,
             review_count: reviewCount,
-            product_image_url: s(raw.representativeImageUrl || raw.imageUrl || raw.productImageUrl || '').split('?')[0],
-            category_name: raw.category ? (raw.category.wholeCategoryName || raw.category.name || '') : '',
+            product_image_url: s(
+              raw.representativeImageUrl || raw.imageUrl || raw.productImageUrl || ''
+            ).split('?')[0],
+            category_name: raw.category
+              ? (raw.category.wholeCategoryName || raw.category.name || '')
+              : '',
             is_sold_out: !!(
               raw.productStatusType === 'OUTOFSTOCK' ||
               raw.soldout === true ||
@@ -363,50 +382,39 @@ async function scrape(params) {
             productNo: pno
           };
 
-          if (pno) out.productNoMap[finalId] = pno;
-        }
-
-        function walk(obj, visitor, depth) {
-          if (!obj || depth > 8) return;
-          if (Array.isArray(obj)) {
-            for (var i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
-            return;
-          }
-          if (typeof obj !== 'object') return;
-          visitor(obj);
-          var keys = Object.keys(obj);
-          for (var k = 0; k < keys.length; k++) {
-            walk(obj[keys[k]], visitor, depth + 1);
+          if (pno) {
+            out.productNoMap[finalId] = pno;
           }
         }
 
-        var out = { products: {}, productNoMap: {}, source: 'none' };
+        const out = { products: {}, productNoMap: {}, source: 'none' };
 
         try {
-          var pre = window.__PRELOADED_STATE__;
+          const pre = window.__PRELOADED_STATE__;
           if (pre) {
             out.source = 'preloaded_state';
 
-            var sp = (pre.categoryProducts && pre.categoryProducts.simpleProducts) || [];
-            for (var i = 0; i < sp.length; i++) {
-              if (typeof sp[i] === 'object' && sp[i]) addProduct(out, sp[i]);
+            const sp = (pre.categoryProducts && pre.categoryProducts.simpleProducts) || [];
+            for (let i = 0; i < sp.length; i++) {
+              if (sp[i] && typeof sp[i] === 'object') addProduct(out, sp[i]);
             }
 
             if (pre.products && typeof pre.products === 'object') {
-              var pKeys = Object.keys(pre.products);
-              for (var pi = 0; pi < pKeys.length; pi++) {
-                addProduct(out, pre.products[pKeys[pi]]);
+              const keys = Object.keys(pre.products);
+              for (let i = 0; i < keys.length; i++) {
+                addProduct(out, pre.products[keys[i]]);
               }
             }
           }
 
-          var nextData = parseNextData();
+          const nextData = parseNextData();
           if (nextData) {
             if (out.source === 'none') out.source = 'next_data';
 
-            walk(nextData, function (node) {
-              var hasProductShape =
-                (node && typeof node === 'object') &&
+            walk(nextData, (node) => {
+              const hasProductShape =
+                node &&
+                typeof node === 'object' &&
                 (
                   node.id !== undefined ||
                   node.productId !== undefined ||
@@ -422,17 +430,17 @@ async function scrape(params) {
               if (hasProductShape) addProduct(out, node);
 
               if (Array.isArray(node.products)) {
-                for (var j = 0; j < node.products.length; j++) {
-                  if (node.products[j] && typeof node.products[j] === 'object') {
-                    addProduct(out, node.products[j]);
+                for (let i = 0; i < node.products.length; i++) {
+                  if (node.products[i] && typeof node.products[i] === 'object') {
+                    addProduct(out, node.products[i]);
                   }
                 }
               }
 
               if (Array.isArray(node.simpleProducts)) {
-                for (var jj = 0; jj < node.simpleProducts.length; jj++) {
-                  if (node.simpleProducts[jj] && typeof node.simpleProducts[jj] === 'object') {
-                    addProduct(out, node.simpleProducts[jj]);
+                for (let i = 0; i < node.simpleProducts.length; i++) {
+                  if (node.simpleProducts[i] && typeof node.simpleProducts[i] === 'object') {
+                    addProduct(out, node.simpleProducts[i]);
                   }
                 }
               }
@@ -444,156 +452,154 @@ async function scrape(params) {
       }, baseUrlRef);
     }
 
-    var stateProducts = await extractProductsFromState(page, baseUrl);
+    const stateInfo = await extractStateInfo(page, baseUrl);
+    result.channel_uid = stateInfo.channelUid || '';
+    result.brand_name = stateInfo.channelName || '';
+    result.debug.stateMethod = stateInfo.method;
+    result.debug.totalIds = stateInfo.allIds.length;
+
+    const productMap = {};
+    const productNoMap = {};
+
+    const stateProducts = await extractProductsFromState(page, baseUrl);
     result.debug.stateProductSource = stateProducts.source;
 
-    var stateProductKeys = Object.keys(stateProducts.products || {});
-    for (var spi = 0; spi < stateProductKeys.length; spi++) {
-      var key = stateProductKeys[spi];
-      var sp = stateProducts.products[key];
+    for (const key of Object.keys(stateProducts.products || {})) {
+      const p = stateProducts.products[key];
       productMap[key] = {
-        product_id: sp.product_id,
-        product_name: sp.product_name,
-        sale_price: sp.sale_price,
-        discount_price: sp.discount_price,
-        review_count: sp.review_count,
+        product_id: p.product_id,
+        product_name: p.product_name,
+        sale_price: p.sale_price,
+        discount_price: p.discount_price,
+        review_count: p.review_count,
         purchase_count_today: 0,
         purchase_text_today: '',
         purchase_prefix_today: '',
         purchase_count_weekly: 0,
         purchase_text_weekly: '',
         purchase_prefix_weekly: '',
-        product_image_url: sp.product_image_url,
-        category_name: sp.category_name,
-        is_sold_out: sp.is_sold_out,
-        product_url: sp.product_url
+        product_image_url: p.product_image_url,
+        category_name: p.category_name,
+        is_sold_out: p.is_sold_out,
+        product_url: p.product_url
       };
-      if (sp.productNo) productNoMap[key] = sp.productNo;
+      if (p.productNo) {
+        productNoMap[key] = p.productNo;
+      }
     }
 
-    var pnoKeys = Object.keys(stateProducts.productNoMap || {});
-    for (var pk = 0; pk < pnoKeys.length; pk++) {
-      productNoMap[pnoKeys[pk]] = stateProducts.productNoMap[pnoKeys[pk]];
+    for (const key of Object.keys(stateProducts.productNoMap || {})) {
+      productNoMap[key] = stateProducts.productNoMap[key];
     }
 
-    // state에서 못 가져온 경우 API fallback
     if (Object.keys(productMap).length === 0 && stateInfo.channelUid && stateInfo.allIds.length > 0) {
-      var apiPaths = (storeType === 'smartstore')
+      const apiPaths = isSmart
         ? ['/i/v2/channels/', '/i/v1/channels/', '/n/v2/channels/', '/n/v1/channels/']
         : ['/n/v2/channels/', '/n/v1/channels/'];
 
-      var batchSize = 20;
+      for (const path of apiPaths) {
+        let localCount = 0;
+        const batchSize = 20;
 
-      for (var pathIdx = 0; pathIdx < apiPaths.length; pathIdx++) {
-        var currentPath = apiPaths[pathIdx];
-        var pathWorked = false;
-        var localCount = 0;
+        for (let i = 0; i < stateInfo.allIds.length; i += batchSize) {
+          const batch = stateInfo.allIds.slice(i, i + batchSize);
 
-        for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
-          var batch = stateInfo.allIds.slice(bi, bi + batchSize);
+          const apiResult = await page.evaluate(async (args) => {
+            const qs = args.ids.map(id => 'ids[]=' + encodeURIComponent(id)).join('&');
+            const url =
+              args.apiBase +
+              args.path +
+              args.uid +
+              '/simple-products?' +
+              qs +
+              '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
 
-          try {
-            var apiResult = await page.evaluate(function (args) {
-              var qs = args.ids.map(function (id) {
-                return 'ids[]=' + encodeURIComponent(id);
-              }).join('&');
-
-              var url =
-                args.apiBase +
-                args.path +
-                args.uid +
-                '/simple-products?' +
-                qs +
-                '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
-
-              return fetch(url, { credentials: 'include' })
-                .then(function (r) {
-                  if (!r.ok) return { _failed: true, _status: r.status, _url: url };
-                  return r.json();
-                })
-                .catch(function (e) {
-                  return { _failed: true, _error: String(e), _url: url };
-                });
-            }, {
-              uid: stateInfo.channelUid,
-              ids: batch,
-              apiBase: apiBase,
-              path: currentPath
-            });
-
-            if (apiResult && apiResult._failed) {
-              if (bi === 0) {
-                console.log('[v28] API path failed: ' + currentPath + ' / ' + (apiResult._status || apiResult._error));
-              }
-              break;
+            try {
+              const r = await fetch(url, { credentials: 'include' });
+              if (!r.ok) return { _failed: true, _status: r.status, _url: url };
+              return await r.json();
+            } catch (e) {
+              return { _failed: true, _error: String(e), _url: url };
             }
+          }, {
+            uid: stateInfo.channelUid,
+            ids: batch,
+            apiBase,
+            path
+          });
 
-            if (Array.isArray(apiResult)) {
-              pathWorked = true;
-
-              for (var ai = 0; ai < apiResult.length; ai++) {
-                var p = apiResult[ai];
-                var pid = String(p.id || p.productId || p.productNo || '');
-                if (!pid) continue;
-
-                var rc = 0;
-                if (p.reviewAmount && typeof p.reviewAmount === 'object') {
-                  rc = p.reviewAmount.totalReviewCount || 0;
-                } else if (p.reviewCount) {
-                  rc = p.reviewCount;
-                }
-
-                var dp = null;
-                if (p.benefitsView && p.benefitsView.discountedSalePrice) {
-                  dp = p.benefitsView.discountedSalePrice;
-                } else if (p.discountedSalePrice) {
-                  dp = p.discountedSalePrice;
-                }
-
-                var pno = String(p.productNo || '');
-
-                productMap[pid] = {
-                  product_id: pid,
-                  product_name: p.name || p.dispName || p.productName || '',
-                  sale_price: p.salePrice || 0,
-                  discount_price: dp,
-                  review_count: rc,
-                  purchase_count_today: 0,
-                  purchase_text_today: '',
-                  purchase_prefix_today: '',
-                  purchase_count_weekly: 0,
-                  purchase_text_weekly: '',
-                  purchase_prefix_weekly: '',
-                  product_image_url: (String(p.representativeImageUrl || p.imageUrl || '')).split('?')[0],
-                  category_name: p.category ? (p.category.wholeCategoryName || p.category.name || '') : '',
-                  is_sold_out: !!(p.productStatusType === 'OUTOFSTOCK' || p.soldout === true || p.isSoldOut === true),
-                  product_url: baseUrl + '/products/' + pid
-                };
-
-                if (pno) productNoMap[pid] = pno;
-                localCount++;
-              }
+          if (apiResult && apiResult._failed) {
+            if (i === 0) {
+              console.log('[v29] simple-products failed:', path, apiResult._status || apiResult._error);
             }
-          } catch (e) {}
+            break;
+          }
 
-          if (bi + batchSize < stateInfo.allIds.length) {
+          if (Array.isArray(apiResult)) {
+            for (const p of apiResult) {
+              const pid = String(p.id || p.productId || p.productNo || '');
+              if (!pid) continue;
+
+              let rc = 0;
+              if (p.reviewAmount && typeof p.reviewAmount === 'object') {
+                rc = p.reviewAmount.totalReviewCount || 0;
+              } else if (p.reviewCount) {
+                rc = p.reviewCount;
+              }
+
+              let dp = null;
+              if (p.benefitsView && p.benefitsView.discountedSalePrice) {
+                dp = p.benefitsView.discountedSalePrice;
+              } else if (p.discountedSalePrice) {
+                dp = p.discountedSalePrice;
+              }
+
+              const pno = String(p.productNo || '');
+
+              productMap[pid] = {
+                product_id: pid,
+                product_name: p.name || p.dispName || p.productName || '',
+                sale_price: p.salePrice || 0,
+                discount_price: dp,
+                review_count: rc,
+                purchase_count_today: 0,
+                purchase_text_today: '',
+                purchase_prefix_today: '',
+                purchase_count_weekly: 0,
+                purchase_text_weekly: '',
+                purchase_prefix_weekly: '',
+                product_image_url: String(p.representativeImageUrl || p.imageUrl || '').split('?')[0],
+                category_name: p.category ? (p.category.wholeCategoryName || p.category.name || '') : '',
+                is_sold_out: !!(
+                  p.productStatusType === 'OUTOFSTOCK' ||
+                  p.soldout === true ||
+                  p.isSoldOut === true
+                ),
+                product_url: `${baseUrl}/products/${pid}`
+              };
+
+              if (pno) productNoMap[pid] = pno;
+              localCount++;
+            }
+          }
+
+          if (i + batchSize < stateInfo.allIds.length) {
             await page.waitForTimeout(200);
           }
         }
 
-        if (pathWorked && localCount > 0) {
-          result.debug.apiPathUsed = currentPath;
-          console.log('[v28] API path worked: ' + currentPath + ', products=' + localCount);
+        if (localCount > 0) {
+          result.debug.apiPathUsed = path;
+          result.debug.apiProducts = localCount;
           break;
         }
       }
     }
 
-    result.debug.apiProducts = Object.keys(productMap).length;
+    result.debug.productCount = Object.keys(productMap).length;
     result.debug.productNoMapped = Object.keys(productNoMap).length;
 
-    // ===== PHASE 3: marketing-message =====
-    var purchaseDebug = {
+    const purchaseDebug = {
       total: 0,
       todayCount: 0,
       weeklyCount: 0,
@@ -603,15 +609,15 @@ async function scrape(params) {
       samples: []
     };
 
-    var allPids = Object.keys(productMap);
-    console.log('[v28] P3 marketing-message total=' + allPids.length);
+    const allPids = Object.keys(productMap);
+    console.log('[v29] marketing-message total=', allPids.length);
 
-    var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
-    var msgApiFallback = '/n/v1/marketing-message/';
+    const msgApiPath = isSmart ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
+    const msgApiFallback = '/n/v1/marketing-message/';
 
     async function callMsg(pageRef, id, basis, apiPath) {
-      return await pageRef.evaluate(function (args) {
-        var url =
+      return await pageRef.evaluate(async (args) => {
+        const url =
           args.apiBase +
           args.path +
           args.id +
@@ -622,199 +628,176 @@ async function scrape(params) {
           '&useRepurchased=true' +
           '&basisRepurchased=' + args.basis;
 
-        return fetch(url, { credentials: 'include' })
-          .then(function (r) {
-            if (!r.ok) return { ok: false, status: r.status, url: url };
-            return r.json().then(function (data) {
-              return { ok: true, data: data, url: url };
-            });
-          })
-          .catch(function (e) {
-            return { ok: false, error: String(e), url: url };
-          });
+        try {
+          const r = await fetch(url, { credentials: 'include' });
+          if (!r.ok) {
+            return { ok: false, status: r.status, url };
+          }
+          const data = await r.json();
+          return { ok: true, data, url };
+        } catch (e) {
+          return { ok: false, error: String(e), url };
+        }
       }, {
-        id: id,
-        basis: basis,
-        apiBase: apiBase,
+        id,
+        basis,
+        apiBase,
         path: apiPath
       });
     }
 
     async function callMsgWithFallback(pageRef, id, basis) {
-      var r = await callMsg(pageRef, id, basis, msgApiPath);
-      if (storeType === 'smartstore' && (!r || !r.ok)) {
+      let r = await callMsg(pageRef, id, basis, msgApiPath);
+      if (isSmart && (!r || !r.ok)) {
         r = await callMsg(pageRef, id, basis, msgApiFallback);
       }
       return r;
     }
 
-    function normalizeText(s) {
-      return String(s || '').replace(/\s+/g, ' ').trim();
-    }
-
-    function extractCount(text) {
-      var t = normalizeText(text);
-      var m = t.match(/(\d[\d,]*)\s*명/);
-      if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-
-      m = t.match(/(\d[\d,]*)\s*건/);
-      if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-
-      return 0;
-    }
-
-    function parseMsg(resultObj) {
-      if (!resultObj || !resultObj.ok || !resultObj.data) return null;
-
-      var prefix = normalizeText(resultObj.data.prefix || '');
-      var phrase = normalizeText(resultObj.data.mainPhrase || '');
-      var fullText = normalizeText(prefix + ' ' + phrase);
-
-      var count = extractCount(phrase);
-      if (!count) count = extractCount(fullText);
-
-      return {
-        prefix: prefix,
-        phrase: phrase,
-        fullText: fullText,
-        count: count,
-        isToday: /오늘/.test(prefix) || /오늘/.test(fullText),
-        isWeekly: /최근\s*1주/.test(prefix) || /최근\s*1주/.test(fullText)
-      };
-    }
-
-    for (var mi = 0; mi < allPids.length; mi++) {
-      var prodId = allPids[mi];
-      var msgId = productNoMap[prodId];
+    for (let i = 0; i < allPids.length; i++) {
+      const prodId = allPids[i];
+      let msgId = productNoMap[prodId];
 
       purchaseDebug.total++;
 
-      // 스마트스토어는 productNo 없으면 억지로 product_id 쓰지 않음
-      if (storeType === 'smartstore' && !msgId) {
+      if (isSmart && !msgId) {
         purchaseDebug.skippedNoProductNo++;
-        if (purchaseDebug.errors.length < 20) {
+        if (purchaseDebug.errors.length < 30) {
           purchaseDebug.errors.push({
             pid: prodId,
-            reason: 'productNo missing for smartstore marketing-message'
+            reason: 'productNo missing for smartstore'
           });
         }
         continue;
       }
 
-      // 브랜드스토어는 productNo 없으면 id fallback 허용
       if (!msgId) msgId = prodId;
 
-      var r1 = await callMsgWithFallback(page, msgId, 1);
-      var p1 = parseMsg(r1);
+      const r1 = await callMsgWithFallback(page, msgId, 1);
+      const p1 = parseMsg(r1);
+
+      if (purchaseDebug.samples.length < 20) {
+        purchaseDebug.samples.push({
+          pid: prodId,
+          msgId,
+          basis: 1,
+          raw: r1,
+          parsed: p1
+        });
+      }
 
       if (!p1 || !p1.count) {
         purchaseDebug.ignored++;
-        if (purchaseDebug.samples.length < 10) {
-          purchaseDebug.samples.push({
-            pid: prodId,
-            msgId: msgId,
-            step1: r1
-          });
-        }
-        if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(250);
         continue;
       }
 
-      // basis=1 에서 바로 최근 1주
       if (p1.isWeekly) {
         productMap[prodId].purchase_count_weekly = p1.count;
         productMap[prodId].purchase_text_weekly = p1.phrase;
         productMap[prodId].purchase_prefix_weekly = p1.prefix;
         purchaseDebug.weeklyCount++;
-
-        if (purchaseDebug.samples.length < 10) {
-          purchaseDebug.samples.push({
-            pid: prodId,
-            msgId: msgId,
-            step1: p1,
-            today: 0,
-            weekly: p1.count
-          });
-        }
         continue;
       }
 
-      // basis=1 이 오늘
       if (p1.isToday) {
         productMap[prodId].purchase_count_today = p1.count;
         productMap[prodId].purchase_text_today = p1.phrase;
         productMap[prodId].purchase_prefix_today = p1.prefix;
         purchaseDebug.todayCount++;
 
-        var weeklyBasisCandidates = [p1.count + 1, p1.count + 2, p1.count];
-        var weeklySaved = false;
+        const candidateSet = new Set();
 
-        for (var bi2 = 0; bi2 < weeklyBasisCandidates.length; bi2++) {
-          var wb = weeklyBasisCandidates[bi2];
-          if (wb < 1) continue;
+        candidateSet.add(p1.count + 1);
+        candidateSet.add(p1.count + 2);
+        candidateSet.add(p1.count);
+        for (let b = 1; b <= 10; b++) candidateSet.add(b);
 
-          var r2 = await callMsgWithFallback(page, msgId, wb);
-          var p2 = parseMsg(r2);
+        const weeklyBasisCandidates = Array.from(candidateSet)
+          .filter(v => Number.isFinite(v) && v >= 1)
+          .sort((a, b) => a - b);
+
+        let weeklySaved = false;
+        const weeklyTried = [];
+
+        for (const wb of weeklyBasisCandidates) {
+          const r2 = await callMsgWithFallback(page, msgId, wb);
+          const p2 = parseMsg(r2);
+
+          weeklyTried.push({
+            basis: wb,
+            raw: r2,
+            parsed: p2
+          });
+
+          console.log('[weekly-check]', JSON.stringify({
+            pid: prodId,
+            msgId,
+            basis: wb,
+            raw: r2,
+            parsed: p2
+          }));
 
           if (p2 && p2.count > 0 && p2.isWeekly) {
             productMap[prodId].purchase_count_weekly = p2.count;
             productMap[prodId].purchase_text_weekly = p2.phrase;
-            productMap[prodId].purchase_prefix_weekly = p2.prefix || ('basis:' + wb);
+            productMap[prodId].purchase_prefix_weekly = p2.prefix || `basis:${wb}`;
             purchaseDebug.weeklyCount++;
             weeklySaved = true;
+
+            if (purchaseDebug.samples.length < 30) {
+              purchaseDebug.samples.push({
+                pid: prodId,
+                msgId,
+                today: p1.count,
+                weeklySaved: true,
+                weeklyBasis: wb,
+                weeklyParsed: p2,
+                weeklyRaw: r2,
+                weeklyTried
+              });
+            }
             break;
           }
         }
 
-        if (purchaseDebug.samples.length < 10) {
+        if (!weeklySaved && purchaseDebug.samples.length < 30) {
           purchaseDebug.samples.push({
             pid: prodId,
-            msgId: msgId,
-            step1: p1,
-            today: productMap[prodId].purchase_count_today,
-            weekly: productMap[prodId].purchase_count_weekly,
-            weeklySaved: weeklySaved
+            msgId,
+            today: p1.count,
+            weeklySaved: false,
+            weeklyTried
           });
         }
       } else {
         purchaseDebug.ignored++;
-        if (purchaseDebug.samples.length < 10) {
-          purchaseDebug.samples.push({
-            pid: prodId,
-            msgId: msgId,
-            step1: p1,
-            reason: 'unknown prefix'
-          });
-        }
       }
 
-      if (mi > 0 && mi % 10 === 0) {
+      if (i > 0 && i % 10 === 0) {
         await page.waitForTimeout(250);
       }
     }
 
     result.debug.purchase = purchaseDebug;
 
-    // ===== PHASE 4: 결과 정리 =====
-    var pids = Object.keys(productMap);
-    for (var fi = 0; fi < pids.length; fi++) {
-      var prod = productMap[pids[fi]];
+    for (const pid of Object.keys(productMap)) {
+      const p = productMap[pid];
       result.data.push({
-        product_id: prod.product_id,
-        product_name: prod.product_name,
-        sale_price: prod.sale_price,
-        discount_price: prod.discount_price,
-        review_count: prod.review_count,
-        purchase_count_today: prod.purchase_count_today,
-        purchase_text_today: prod.purchase_text_today,
-        purchase_prefix_today: prod.purchase_prefix_today,
-        purchase_count_weekly: prod.purchase_count_weekly,
-        purchase_text_weekly: prod.purchase_text_weekly,
-        purchase_prefix_weekly: prod.purchase_prefix_weekly,
-        product_image_url: prod.product_image_url,
-        category_name: prod.category_name,
-        is_sold_out: prod.is_sold_out,
-        product_url: prod.product_url
+        product_id: p.product_id,
+        product_name: p.product_name,
+        sale_price: p.sale_price,
+        discount_price: p.discount_price,
+        review_count: p.review_count,
+        purchase_count_today: p.purchase_count_today,
+        purchase_text_today: p.purchase_text_today,
+        purchase_prefix_today: p.purchase_prefix_today,
+        purchase_count_weekly: p.purchase_count_weekly,
+        purchase_text_weekly: p.purchase_text_weekly,
+        purchase_prefix_weekly: p.purchase_prefix_weekly,
+        product_image_url: p.product_image_url,
+        category_name: p.category_name,
+        is_sold_out: p.is_sold_out,
+        product_url: p.product_url
       });
     }
 
@@ -824,82 +807,34 @@ async function scrape(params) {
       result.status = 'EMPTY';
       result.error = 'No products found';
     }
+
+    return result;
   } catch (e) {
     result.status = 'ERROR';
     result.error = e.message || String(e);
+    return result;
   } finally {
-    try { if (page) await page.close(); } catch (x) {}
-    try { if (ctx) await ctx.close(); } catch (x) {}
-  }
-
-  return result;
-}
-
-async function spy(params) {
-  var url = params.url || 'https://brand.naver.com/dcurvin/products/12569074482';
-  var br = null;
-  var ctx = null;
-  var page = null;
-  var captured = [];
-
-  try {
-    br = await getBrowser();
-    ctx = await br.newContext(ctxOpts());
-    page = await ctx.newPage();
-
-    page.on('response', async function (response) {
-      try {
-        var reqUrl = response.url();
-        var ct = response.headers()['content-type'] || '';
-        if (ct.indexOf('json') > -1 && response.status() === 200) {
-          var body = await response.text();
-          captured.push({
-            url: reqUrl.length > 240 ? reqUrl.slice(0, 240) + '...' : reqUrl,
-            status: response.status(),
-            size: body.length,
-            snippet: body.slice(0, 500)
-          });
-        }
-      } catch (e) {}
-    });
-
-    await page.addInitScript(stealth);
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
-    await page.waitForTimeout(3000);
-
-    return {
-      status: 'OK',
-      url: url,
-      captured_count: captured.length,
-      captured: captured
-    };
-  } catch (e) {
-    return {
-      status: 'ERROR',
-      error: e.message,
-      captured: captured
-    };
-  } finally {
-    try { if (page) await page.close(); } catch (x) {}
-    try { if (ctx) await ctx.close(); } catch (x) {}
+    try {
+      if (page) await page.close();
+    } catch (e) {}
+    try {
+      if (ctx) await ctx.close();
+    } catch (e) {}
   }
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v28] action=' + action);
+  console.log('[naver_store v29] action=', action);
 
   try {
     if (action === 'scrape') {
-      return res.json(await scrape(req.body));
-    }
-
-    if (action === 'spy') {
-      return res.json(await spy(req.body));
+      const out = await scrape(req.body || {});
+      return res.json(out);
     }
 
     return res.status(400).json({
       status: 'ERROR',
-      message: 'Unknown action: ' + action
+      message: `Unknown action: ${action}`
     });
   } catch (e) {
     if (!res.headersSent) {
