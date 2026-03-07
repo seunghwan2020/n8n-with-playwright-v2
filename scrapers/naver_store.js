@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v25.1_smartstore_fix',
-    debug: { build: 'V25.1_SMARTSTORE_FIX', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v25.2_multi_basis',
+    debug: { build: 'V25.2_MULTI_BASIS', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -367,119 +367,133 @@ async function scrape(params) {
     result.debug.productNoMapped = Object.keys(productNoMap).length;
 
     // ===== PHASE 3: marketing-message API =====
-    // ★★★ v25 핵심 수정: prefix 우선 분류 (isCumulative로 무조건 skip하지 않음) ★★★
+    // ★★★ v25.2: basisRepurchased가 상품마다 다름 (1,2,4,7,14,23 등)
+    // → 브라우저 내 Promise.all로 병렬 fetch하여 속도 저하 없이 모든 basis 시도 ★★★
     var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v25] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v25.2] P3: marketing-message for ' + allPids.length + ' products');
 
-    // ★ smartstore용 marketing-message 경로도 다름
-    var msgApiPaths = (storeType === 'smartstore')
-      ? ['/i/v1/marketing-message/', '/n/v1/marketing-message/']
-      : ['/n/v1/marketing-message/'];
-    var msgApiPath = msgApiPaths[0]; // 기본값, 첫 성공 시 고정
+    // smartstore용 API 경로
+    var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
 
-    async function fetchMsg(productNoId, basis) {
-      for (var mpi = 0; mpi < msgApiPaths.length; mpi++) {
-        var tryPath = (mpi === 0) ? msgApiPath : msgApiPaths[mpi];
-        try {
-          var msgResult = await page.evaluate(function(args) {
-            var url = args.apiBase + args.msgPath + args.id
-              + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-              + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
-            return fetch(url, { credentials: 'include' })
-              .then(function(r) {
-                if (!r.ok) return { ok: false, status: r.status };
-                return r.json().then(function(data) { return { ok: true, data: data }; });
-              })
-              .catch(function(err) { return { ok: false, error: String(err) }; });
-          }, { id: productNoId, basis: basis, apiBase: apiBase, msgPath: tryPath });
-
-          if (msgResult && msgResult.ok && msgResult.data) {
-            msgApiPath = tryPath; // 성공한 경로 기억
-            var phrase = msgResult.data.mainPhrase || '';
-            var prefix = msgResult.data.prefix || '';
-            var count = 0;
-            var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
-            if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
-            var hasIsang = phrase.indexOf('\uC774\uC0C1') > -1;
-            return { ok: true, count: count, phrase: phrase, prefix: (prefix || '').trim(), hasIsang: hasIsang };
-          }
-          // 404/실패 시 다음 경로 시도
-        } catch(e) {}
-      }
-      return { ok: false };
-    }
-
+    // ★ 상품별로 모든 basis 값을 병렬 fetch → 오늘/주간 데이터 추출
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
 
-      var r1 = await fetchMsg(msgId, 1);
-      var r2 = await fetchMsg(msgId, 2);
+      // ★ 브라우저 내에서 모든 basis를 동시에 fetch (Promise.all → 1회 evaluate로 전부 처리)
+      var allResults = await page.evaluate(function(args) {
+        var bases = [1, 2, 4, 7, 14, 23, 30];
+        var promises = bases.map(function(basis) {
+          var url = args.apiBase + args.msgPath + args.id
+            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
+          return fetch(url, { credentials: 'include' })
+            .then(function(r) {
+              if (!r.ok) return { ok: false, basis: basis };
+              return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
+            })
+            .catch(function() { return { ok: false, basis: basis }; });
+        });
+        return Promise.all(promises);
+      }, { id: msgId, apiBase: apiBase, msgPath: msgApiPath });
 
-      // ===== v25: prefix 우선 분류 (이상 여부와 무관하게 prefix로 판단) =====
-      // prefix "오늘" → today (이상 포함해도 OK)
-      // prefix "최근" → weekly (이상 포함해도 OK)
-      // prefix 없고 "이상" 있음 → 누적, 무시
-      // prefix 없고 "이상" 없음 → weekly fallback
-
-      var allR = [];
-      if (r1.ok) allR.push(r1);
-      if (r2.ok) allR.push(r2);
-
-      for (var ri = 0; ri < allR.length; ri++) {
-        var r = allR[ri];
-        var pfx = r.prefix;
-
-        if (pfx.indexOf('\uC624\uB298') > -1) {
-          // prefix에 "오늘" → today (★ "이상" 여부 무관)
-          productMap[prodId].purchase_count_today = r.count;
-          productMap[prodId].purchase_text_today = r.phrase;
-          productMap[prodId].purchase_prefix_today = pfx;
-          purchaseDebug.todayCount++;
-        } else if (pfx.indexOf('\uCD5C\uADFC') > -1) {
-          // prefix에 "최근" → weekly (★ "이상" 여부 무관 — 핵심 수정!)
-          productMap[prodId].purchase_count_weekly = r.count;
-          productMap[prodId].purchase_text_weekly = r.phrase;
-          productMap[prodId].purchase_prefix_weekly = pfx;
-          purchaseDebug.weeklyCount++;
-        } else if (pfx === '' || pfx === undefined) {
-          // prefix 없는 경우
-          if (r.hasIsang) {
-            // "이상" 있고 prefix 없음 → 진짜 누적, 무시
-            purchaseDebug.ignoredCumul++;
-          } else {
-            // "이상" 없고 prefix 없음 → weekly fallback
-            if (r.count > productMap[prodId].purchase_count_weekly) {
-              productMap[prodId].purchase_count_weekly = r.count;
-              productMap[prodId].purchase_text_weekly = r.phrase;
-              productMap[prodId].purchase_prefix_weekly = 'auto';
-              purchaseDebug.weeklyCount++;
-            }
-          }
+      // smartstore fallback: 메인 경로 전부 실패 시 /n/v1/ 시도
+      if (storeType === 'smartstore') {
+        var anyOk = false;
+        for (var ci = 0; ci < allResults.length; ci++) { if (allResults[ci].ok) { anyOk = true; break; } }
+        if (!anyOk) {
+          allResults = await page.evaluate(function(args) {
+            var bases = [1, 2, 4, 7, 14, 23, 30];
+            var promises = bases.map(function(basis) {
+              var url = args.apiBase + '/n/v1/marketing-message/' + args.id
+                + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+                + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
+              return fetch(url, { credentials: 'include' })
+                .then(function(r) {
+                  if (!r.ok) return { ok: false, basis: basis };
+                  return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
+                })
+                .catch(function() { return { ok: false, basis: basis }; });
+            });
+            return Promise.all(promises);
+          }, { id: msgId, apiBase: apiBase });
         }
       }
 
-      if (purchaseDebug.samples.length < 5) {
+      // ★ 결과 파싱: prefix 기반 분류 (오늘/최근/누적)
+      var todayFound = false;
+      var weeklyFound = false;
+
+      for (var ri = 0; ri < allResults.length; ri++) {
+        var ar = allResults[ri];
+        if (!ar.ok || !ar.data) continue;
+
+        var phrase = ar.data.mainPhrase || '';
+        var prefix = (ar.data.prefix || '').trim();
+        var count = 0;
+        var numMatch = phrase.match(/(\d[\d,]*)\s*\uBA85/);
+        if (numMatch) count = parseInt(numMatch[1].replace(/,/g, ''));
+        if (count === 0) continue;
+
+        var hasIsang = phrase.indexOf('\uC774\uC0C1') > -1;
+
+        if (prefix.indexOf('\uC624\uB298') > -1 && !todayFound) {
+          // "오늘" → today
+          productMap[prodId].purchase_count_today = count;
+          productMap[prodId].purchase_text_today = phrase;
+          productMap[prodId].purchase_prefix_today = prefix;
+          purchaseDebug.todayCount++;
+          todayFound = true;
+        } else if (prefix.indexOf('\uCD5C\uADFC') > -1 && !weeklyFound) {
+          // "최근" → weekly (★ "이상" 여부 무관!)
+          productMap[prodId].purchase_count_weekly = count;
+          productMap[prodId].purchase_text_weekly = phrase;
+          productMap[prodId].purchase_prefix_weekly = prefix;
+          purchaseDebug.weeklyCount++;
+          weeklyFound = true;
+        } else if (prefix === '' && !hasIsang && !weeklyFound) {
+          // prefix 없고 "이상" 아닌 정확한 수치 → weekly fallback
+          if (count > productMap[prodId].purchase_count_weekly) {
+            productMap[prodId].purchase_count_weekly = count;
+            productMap[prodId].purchase_text_weekly = phrase;
+            productMap[prodId].purchase_prefix_weekly = 'auto:basis' + ar.basis;
+            purchaseDebug.weeklyCount++;
+            weeklyFound = true;
+          }
+        } else if (prefix === '' && hasIsang) {
+          purchaseDebug.ignoredCumul++;
+        }
+
+        if (todayFound && weeklyFound) break;
+      }
+
+      if (purchaseDebug.samples.length < 8) {
+        var sampleResults = [];
+        for (var si = 0; si < allResults.length; si++) {
+          if (allResults[si].ok && allResults[si].data && allResults[si].data.mainPhrase) {
+            sampleResults.push({ basis: allResults[si].basis, pfx: (allResults[si].data.prefix||'').trim(), phrase: allResults[si].data.mainPhrase });
+          }
+        }
         purchaseDebug.samples.push({
           pid: prodId, msgId: msgId,
-          r1: r1.ok ? { pfx: r1.prefix, phrase: r1.phrase, isang: r1.hasIsang } : 'fail',
-          r2: r2.ok ? { pfx: r2.prefix, phrase: r2.phrase, isang: r2.hasIsang } : 'fail',
+          responses: sampleResults,
           today: productMap[prodId].purchase_count_today,
           weekly: productMap[prodId].purchase_count_weekly
         });
       }
 
-      if (!r1.ok && !r2.ok && purchaseDebug.errors.length < 3) {
+      if (!todayFound && !weeklyFound && purchaseDebug.errors.length < 3) {
         purchaseDebug.errors.push({ pid: prodId, msgId: msgId });
       }
 
+      // 5개 상품마다 300ms 대기 (rate limit 방지)
       if (mi > 0 && mi % 5 === 0) await page.waitForTimeout(300);
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v25] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
+    console.log('[v25.2] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -536,7 +550,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v25.1] action=' + action);
+  console.log('[naver_store v25.2] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
