@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v25.2_multi_basis',
-    debug: { build: 'V25.2_MULTI_BASIS', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v25.3_full_basis',
+    debug: { build: 'V25.3_FULL_BASIS', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -386,7 +386,7 @@ async function scrape(params) {
     // → 브라우저 내 Promise.all로 병렬 fetch하여 속도 저하 없이 모든 basis 시도 ★★★
     var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v25.2] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v25.3] P3: marketing-message for ' + allPids.length + ' products');
 
     // smartstore용 API 경로
     var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
@@ -399,7 +399,9 @@ async function scrape(params) {
 
       // ★ 브라우저 내에서 모든 basis를 동시에 fetch (Promise.all → 1회 evaluate로 전부 처리)
       var allResults = await page.evaluate(function(args) {
-        var bases = [1, 2, 4, 7, 14, 23, 30];
+        // ★ v25.3: 1~30 전범위 시도 (상품마다 basis가 다르므로 빈틈없이 커버)
+        var bases = [];
+        for (var b = 1; b <= 30; b++) bases.push(b);
         var promises = bases.map(function(basis) {
           var url = args.apiBase + args.msgPath + args.id
             + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
@@ -420,7 +422,8 @@ async function scrape(params) {
         for (var ci = 0; ci < allResults.length; ci++) { if (allResults[ci].ok) { anyOk = true; break; } }
         if (!anyOk) {
           allResults = await page.evaluate(function(args) {
-            var bases = [1, 2, 4, 7, 14, 23, 30];
+            var bases = [];
+            for (var b = 1; b <= 30; b++) bases.push(b);
             var promises = bases.map(function(basis) {
               var url = args.apiBase + '/n/v1/marketing-message/' + args.id
                 + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
@@ -508,7 +511,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v25.2] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
+    console.log('[v25.3] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -565,7 +568,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v25.2] action=' + action);
+  console.log('[naver_store v25.3] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
