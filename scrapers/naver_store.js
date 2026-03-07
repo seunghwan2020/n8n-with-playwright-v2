@@ -426,6 +426,7 @@ async function scrape(params) {
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
 
+      try {
       // ★ Step 1: basis=1 과 basis=2를 동시에 호출 (자동 3회 재시도)
       var bothResults = await apiPage.evaluate(function(args) {
         function doFetch(basis, retry) {
@@ -448,6 +449,11 @@ async function scrape(params) {
         }
         return Promise.all([doFetch(1), doFetch(2)]);
       }, { id: msgId, apiBase: apiBase, path: msgApiPath });
+
+      if (!bothResults || !Array.isArray(bothResults) || bothResults.length < 2) {
+        purchaseDebug.ignoredCumul++;
+        continue;
+      }
 
       var r1 = bothResults[0].ok ? parseMsgData(bothResults[0].data) : null;
       var r2 = bothResults[1].ok ? parseMsgData(bothResults[1].data) : null;
@@ -527,6 +533,13 @@ async function scrape(params) {
 
       if (!todayResult && !weeklyResult && purchaseDebug.errors.length < 5) {
         purchaseDebug.errors.push({ pid: prodId, msgId: msgId });
+      }
+
+      } catch(productErr) {
+        // ★ 개별 상품 에러 → 해당 상품만 건너뛰고 계속 진행
+        if (purchaseDebug.errors.length < 10) {
+          purchaseDebug.errors.push({ pid: prodId, msgId: msgId, error: String(productErr).substring(0, 100) });
+        }
       }
 
       // 10개 상품마다 200ms 대기
