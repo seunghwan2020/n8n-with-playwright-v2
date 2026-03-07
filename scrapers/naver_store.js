@@ -401,7 +401,7 @@ async function scrape(params) {
       var allResults = await page.evaluate(function(args) {
         // ★ v25.3: 1~30 전범위 시도 (상품마다 basis가 다르므로 빈틈없이 커버)
         var bases = [];
-        for (var b = 1; b <= 30; b++) bases.push(b);
+        for (var b = 1; b <= 50; b++) bases.push(b);
         var promises = bases.map(function(basis) {
           var url = args.apiBase + args.msgPath + args.id
             + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
@@ -423,7 +423,7 @@ async function scrape(params) {
         if (!anyOk) {
           allResults = await page.evaluate(function(args) {
             var bases = [];
-            for (var b = 1; b <= 30; b++) bases.push(b);
+            for (var b = 1; b <= 50; b++) bases.push(b);
             var promises = bases.map(function(basis) {
               var url = args.apiBase + '/n/v1/marketing-message/' + args.id
                 + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
