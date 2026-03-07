@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v26.1_robust_basis',
-    debug: { build: 'V26.1_ROBUST_BASIS', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v26.2_dual_fetch',
+    debug: { build: 'V26.2_DUAL_FETCH', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -382,40 +382,28 @@ async function scrape(params) {
     result.debug.productNoMapped = Object.keys(productNoMap).length;
 
     // ===== PHASE 3: marketing-message API =====
-    // ★★★ v26: basis 패턴 완전 해독!
-    // basis=1 → "오늘 N명 구매" (오늘 데이터)
-    // basis=(N+1) → "최근 1주간 M명 구매" (주간 데이터)
-    // 오늘 구매 없으면 basis=1에서 바로 "최근 1주간" 반환
-    // → 상품당 정확히 1~2회만 호출! ★★★
+    // ★★★ v26.2: basis=1과 basis=2를 Promise.all로 동시 호출
+    // basis=1 → "오늘 N명" or "최근 1주간 M명"
+    // basis=2 → "최근 1주간 M명" (오늘 1명일 때) or "오늘 N명" (오늘 >1일 때)
+    // 오늘 >1이면 추가로 basis=(count+1) 호출
+    // → 대부분 상품 1회 evaluate (2 fetch 동시), 최대 2회 ★★★
     var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v26.1] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v26.2] P3: marketing-message for ' + allPids.length + ' products');
 
     var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
     var msgApiFallback = '/n/v1/marketing-message/';
 
-    async function callMsg(pageRef, id, basis, apiPath) {
-      return await pageRef.evaluate(function(args) {
-        var url = args.apiBase + args.path + args.id
-          + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-          + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
-        return fetch(url, { credentials: 'include' })
-          .then(function(r) {
-            if (!r.ok) return { ok: false, status: r.status };
-            return r.json().then(function(data) { return { ok: true, data: data }; });
-          })
-          .catch(function(e) { return { ok: false, error: String(e) }; });
-      }, { id: id, basis: basis, apiBase: apiBase, path: apiPath });
-    }
-
-    function parseMsg(result) {
-      if (!result || !result.ok || !result.data) return null;
-      var phrase = result.data.mainPhrase || '';
-      var prefix = (result.data.prefix || '').trim();
+    function parseMsgData(data) {
+      if (!data || !data.mainPhrase) return null;
+      var phrase = data.mainPhrase || '';
+      var prefix = (data.prefix || '').trim();
       var count = 0;
       var nm = phrase.match(/(\d[\d,]*)\s*\uBA85/);
       if (nm) count = parseInt(nm[1].replace(/,/g, ''));
-      return { count: count, phrase: phrase, prefix: prefix };
+      var isToday = prefix.indexOf('\uC624\uB298') > -1;
+      var isWeekly = prefix.indexOf('\uCD5C\uADFC') > -1;
+      return { count: count, phrase: phrase, prefix: prefix, isToday: isToday, isWeekly: isWeekly };
     }
 
     for (var mi = 0; mi < allPids.length; mi++) {
@@ -423,126 +411,116 @@ async function scrape(params) {
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
 
-      // ★ Step 1: basis=1 호출
-      var r1 = await callMsg(page, msgId, 1, msgApiPath);
+      // ★ Step 1: basis=1 과 basis=2를 동시에 호출
+      var bothResults = await page.evaluate(function(args) {
+        function doFetch(basis) {
+          var url = args.apiBase + args.path + args.id
+            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
+          return fetch(url, { credentials: 'include' })
+            .then(function(r) {
+              if (!r.ok) return { ok: false, basis: basis, status: r.status };
+              return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
+            })
+            .catch(function(e) { return { ok: false, basis: basis, error: String(e) }; });
+        }
+        return Promise.all([doFetch(1), doFetch(2)]);
+      }, { id: msgId, apiBase: apiBase, path: msgApiPath });
 
       // smartstore fallback
-      if (storeType === 'smartstore' && (!r1 || !r1.ok)) {
-        r1 = await callMsg(page, msgId, 1, msgApiFallback);
+      if (storeType === 'smartstore' && (!bothResults[0].ok && !bothResults[1].ok)) {
+        bothResults = await page.evaluate(function(args) {
+          function doFetch(basis) {
+            var url = args.apiBase + args.path + args.id
+              + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+              + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
+            return fetch(url, { credentials: 'include' })
+              .then(function(r) {
+                if (!r.ok) return { ok: false, basis: basis };
+                return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
+              })
+              .catch(function(e) { return { ok: false, basis: basis }; });
+          }
+          return Promise.all([doFetch(1), doFetch(2)]);
+        }, { id: msgId, apiBase: apiBase, path: msgApiFallback });
       }
 
-      var p1 = parseMsg(r1);
+      var r1 = bothResults[0].ok ? parseMsgData(bothResults[0].data) : null;
+      var r2 = bothResults[1].ok ? parseMsgData(bothResults[1].data) : null;
 
-      if (!p1 || p1.count === 0) {
-        // 데이터 없음
-        purchaseDebug.ignoredCumul++;
-        if (purchaseDebug.samples.length < 8) {
-          purchaseDebug.samples.push({ pid: prodId, msgId: msgId, step1: 'no_data', today: 0, weekly: 0 });
+      var todayResult = null;
+      var weeklyResult = null;
+
+      // ★ r1 (basis=1) 분석
+      if (r1 && r1.count > 0) {
+        if (r1.isToday) todayResult = r1;
+        else if (r1.isWeekly) weeklyResult = r1;
+      }
+
+      // ★ r2 (basis=2) 분석
+      if (r2 && r2.count > 0) {
+        if (r2.isToday && !todayResult) todayResult = r2;
+        else if (r2.isWeekly && !weeklyResult) weeklyResult = r2;
+      }
+
+      // ★ 오늘 count > 1인 경우: basis=(count+1)로 추가 호출 필요
+      if (todayResult && todayResult.count > 1 && !weeklyResult) {
+        var exactBasis = todayResult.count + 1;
+        var r3 = await page.evaluate(function(args) {
+          var url = args.apiBase + args.path + args.id
+            + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
+            + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
+          return fetch(url, { credentials: 'include' })
+            .then(function(r) {
+              if (!r.ok) return { ok: false };
+              return r.json().then(function(data) { return { ok: true, data: data }; });
+            })
+            .catch(function() { return { ok: false }; });
+        }, { id: msgId, apiBase: apiBase, path: msgApiPath, basis: exactBasis });
+
+        var p3 = r3.ok ? parseMsgData(r3.data) : null;
+        if (p3 && p3.count > 0 && p3.isWeekly) {
+          weeklyResult = p3;
         }
-        if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
-        continue;
       }
 
-      if (p1.prefix.indexOf('\uC624\uB298') > -1) {
-        // ★ "오늘" → 오늘 데이터 저장
-        productMap[prodId].purchase_count_today = p1.count;
-        productMap[prodId].purchase_text_today = p1.phrase;
-        productMap[prodId].purchase_prefix_today = p1.prefix;
+      // ★ 결과 저장
+      if (todayResult) {
+        productMap[prodId].purchase_count_today = todayResult.count;
+        productMap[prodId].purchase_text_today = todayResult.phrase;
+        productMap[prodId].purchase_prefix_today = todayResult.prefix;
         purchaseDebug.todayCount++;
-
-        // ★ Step 2: basis=(오늘count + 1) → 주간 데이터
-        var weeklyBasis = p1.count + 1;
-        var r2 = await callMsg(page, msgId, weeklyBasis, msgApiPath);
-        if (storeType === 'smartstore' && (!r2 || !r2.ok)) {
-          r2 = await callMsg(page, msgId, weeklyBasis, msgApiFallback);
-        }
-        var p2 = parseMsg(r2);
-
-        // ★ Step 2 결과 확인: "최근" prefix가 있으면 성공
-        var weeklyFound = false;
-        if (p2 && p2.count > 0 && p2.prefix.indexOf('\uCD5C\uADFC') > -1) {
-          productMap[prodId].purchase_count_weekly = p2.count;
-          productMap[prodId].purchase_text_weekly = p2.phrase;
-          productMap[prodId].purchase_prefix_weekly = p2.prefix;
-          purchaseDebug.weeklyCount++;
-          weeklyFound = true;
-        }
-
-        // ★ Step 2 실패 (여전히 "오늘"이 나옴) → 확장 basis 병렬 시도
-        if (!weeklyFound) {
-          var extraBases = [];
-          var base = p1.count;
-          // count+2, +5, +10, +20, +50, +100 시도
-          var offsets = [2, 5, 10, 20, 50, 100];
-          for (var oi = 0; oi < offsets.length; oi++) {
-            var b = base + offsets[oi];
-            if (b > 1 && b !== weeklyBasis) extraBases.push(b);
-          }
-
-          if (extraBases.length > 0) {
-            var extraResults = await page.evaluate(function(args) {
-              var promises = args.bases.map(function(basis) {
-                var url = args.apiBase + args.path + args.id
-                  + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-                  + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + basis;
-                return fetch(url, { credentials: 'include' })
-                  .then(function(r) {
-                    if (!r.ok) return { ok: false, basis: basis };
-                    return r.json().then(function(data) { return { ok: true, basis: basis, data: data }; });
-                  })
-                  .catch(function() { return { ok: false, basis: basis }; });
-              });
-              return Promise.all(promises);
-            }, { id: msgId, apiBase: apiBase, path: msgApiPath, bases: extraBases });
-
-            for (var ei = 0; ei < extraResults.length; ei++) {
-              var er = extraResults[ei];
-              if (!er.ok || !er.data) continue;
-              var ep = parseMsg(er);
-              if (ep && ep.count > 0 && ep.prefix.indexOf('\uCD5C\uADFC') > -1) {
-                productMap[prodId].purchase_count_weekly = ep.count;
-                productMap[prodId].purchase_text_weekly = ep.phrase;
-                productMap[prodId].purchase_prefix_weekly = ep.prefix;
-                purchaseDebug.weeklyCount++;
-                weeklyFound = true;
-                break;
-              }
-            }
-          }
-        }
-
-      } else if (p1.prefix.indexOf('\uCD5C\uADFC') > -1) {
-        // ★ basis=1에서 바로 "최근 1주간" → 오늘 구매 없음, 주간만 저장
-        productMap[prodId].purchase_count_weekly = p1.count;
-        productMap[prodId].purchase_text_weekly = p1.phrase;
-        productMap[prodId].purchase_prefix_weekly = p1.prefix;
+      }
+      if (weeklyResult) {
+        productMap[prodId].purchase_count_weekly = weeklyResult.count;
+        productMap[prodId].purchase_text_weekly = weeklyResult.phrase;
+        productMap[prodId].purchase_prefix_weekly = weeklyResult.prefix;
         purchaseDebug.weeklyCount++;
-
-      } else if (p1.prefix === '' && p1.phrase.indexOf('\uC774\uC0C1') === -1) {
-        // prefix 없고 "이상" 아님 → 주간 fallback
-        productMap[prodId].purchase_count_weekly = p1.count;
-        productMap[prodId].purchase_text_weekly = p1.phrase;
-        productMap[prodId].purchase_prefix_weekly = 'auto:basis1';
-        purchaseDebug.weeklyCount++;
-      } else {
+      }
+      if (!todayResult && !weeklyResult) {
         purchaseDebug.ignoredCumul++;
       }
 
       if (purchaseDebug.samples.length < 8) {
         purchaseDebug.samples.push({
           pid: prodId, msgId: msgId,
-          step1: p1 ? { pfx: p1.prefix, phrase: p1.phrase, count: p1.count } : 'fail',
+          r1: r1 ? { pfx: r1.prefix, count: r1.count, isT: r1.isToday, isW: r1.isWeekly } : 'fail',
+          r2: r2 ? { pfx: r2.prefix, count: r2.count, isT: r2.isToday, isW: r2.isWeekly } : 'fail',
           today: productMap[prodId].purchase_count_today,
           weekly: productMap[prodId].purchase_count_weekly
         });
       }
 
-      // 10개 상품마다 200ms 대기 (가벼워서 간격 줄임)
+      if (!todayResult && !weeklyResult && purchaseDebug.errors.length < 5) {
+        purchaseDebug.errors.push({ pid: prodId, msgId: msgId });
+      }
+
+      // 10개 상품마다 200ms 대기
       if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v26.1] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
+    console.log('[v26.2] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -599,7 +577,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v26.1] action=' + action);
+  console.log('[naver_store v26.2] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
