@@ -6,7 +6,12 @@ async function getBrowser() {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ]
     });
   }
   return browser;
@@ -18,28 +23,40 @@ function ctxOpts() {
     viewport: { width: 1920, height: 1080 },
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
-    extraHTTPHeaders: { 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7' }
+    extraHTTPHeaders: {
+      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
   };
 }
 
-var stealth = function() {
-  Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
-  Object.defineProperty(navigator, 'plugins', { get: function() { return [1, 2, 3, 4, 5]; } });
-  Object.defineProperty(navigator, 'languages', { get: function() { return ['ko-KR', 'ko', 'en-US', 'en']; } });
+var stealth = function () {
+  Object.defineProperty(navigator, 'webdriver', { get: function () { return false; } });
+  Object.defineProperty(navigator, 'plugins', { get: function () { return [1, 2, 3, 4, 5]; } });
+  Object.defineProperty(navigator, 'languages', { get: function () { return ['ko-KR', 'ko', 'en-US', 'en']; } });
   window.chrome = { runtime: {} };
 };
 
-// ============ SCRAPE v27: basisRepurchased 방어 로직 강화 + smartstore 개선 ============
 async function scrape(params) {
   var storeSlug = params.store_slug || 'dcurvin';
   var storeType = params.store_type || 'brand';
+
   var result = {
-    status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v27_basis_hardened',
-    debug: { build: 'V27_BASIS_HARDENED', storeSlug: storeSlug, storeType: storeType }
+    status: 'OK',
+    data: [],
+    channel_uid: '',
+    brand_name: '',
+    error: null,
+    method_used: 'v28_smartstore_fixed',
+    debug: {
+      build: 'V28_SMARTSTORE_FIXED',
+      storeSlug: storeSlug,
+      storeType: storeType
+    }
   };
 
-  var br = null; var ctx = null; var page = null;
+  var br = null;
+  var ctx = null;
+  var page = null;
 
   try {
     br = await getBrowser();
@@ -47,7 +64,6 @@ async function scrape(params) {
     page = await ctx.newPage();
     await page.addInitScript(stealth);
 
-    // ★ baseUrl과 apiBase를 스토어 타입에 맞게 설정
     var baseUrl, apiBase;
     if (storeType === 'smartstore') {
       baseUrl = 'https://smartstore.naver.com/' + storeSlug;
@@ -57,322 +73,517 @@ async function scrape(params) {
       apiBase = 'https://brand.naver.com';
     }
 
-    // ===== PHASE 1: 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v25] P1: ' + targetUrl);
+    console.log('[v28] P1 targetUrl = ' + targetUrl);
 
-    // ★ smartstore는 networkidle 대신 domcontentloaded + 충분한 대기
-    var waitStrategy = (storeType === 'smartstore') ? 'domcontentloaded' : 'networkidle';
-    await page.goto(targetUrl, { waitUntil: waitStrategy, timeout: 45000 });
-    await page.waitForTimeout(3000);
+    await page.goto(targetUrl, {
+      waitUntil: storeType === 'smartstore' ? 'domcontentloaded' : 'networkidle',
+      timeout: 45000
+    });
 
-    // ★ smartstore: __NEXT_DATA__ 또는 __PRELOADED_STATE__ 로딩 대기
+    await page.waitForTimeout(3500);
+
     if (storeType === 'smartstore') {
       try {
-        await page.waitForFunction(function() {
-          return window.__PRELOADED_STATE__ || window.__NEXT_DATA__;
+        await page.waitForFunction(function () {
+          return !!window.__PRELOADED_STATE__ || !!window.__NEXT_DATA__;
         }, { timeout: 10000 });
-      } catch(e) {
-        console.log('[v25] smartstore state wait timeout, continuing...');
+      } catch (e) {
+        console.log('[v28] smartstore state wait timeout');
       }
       await page.waitForTimeout(2000);
     }
 
     for (var si = 0; si < 5; si++) {
-      try { await page.evaluate(function() { if (document.body) window.scrollTo(0, document.body.scrollHeight); }); } catch(e) { break; }
-      await page.waitForTimeout(1500);
+      try {
+        await page.evaluate(function () {
+          if (document.body) window.scrollTo(0, document.body.scrollHeight);
+        });
+      } catch (e) {
+        break;
+      }
+      await page.waitForTimeout(1200);
     }
 
-    // page 2 도 시도 (상품이 많은 스토어)
-    var page2Url = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=2&size=80';
+    async function extractStateInfo(pageRef, baseUrlRef) {
+      return await pageRef.evaluate(function (baseUrlInner) {
+        function asString(v) {
+          return v === null || v === undefined ? '' : String(v);
+        }
+
+        function pushId(idSet, v) {
+          var s = asString(v);
+          if (s && /^\d+$/.test(s)) idSet[s] = true;
+        }
+
+        function walk(obj, visitor, depth) {
+          if (!obj || depth > 8) return;
+          if (Array.isArray(obj)) {
+            for (var i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
+            return;
+          }
+          if (typeof obj !== 'object') return;
+          visitor(obj);
+          var keys = Object.keys(obj);
+          for (var k = 0; k < keys.length; k++) {
+            walk(obj[keys[k]], visitor, depth + 1);
+          }
+        }
+
+        function parseNextData() {
+          try {
+            if (window.__NEXT_DATA__) return window.__NEXT_DATA__;
+            var el = document.getElementById('__NEXT_DATA__');
+            if (el && el.textContent) return JSON.parse(el.textContent);
+          } catch (e) {}
+          return null;
+        }
+
+        var out = {
+          channelUid: '',
+          channelName: '',
+          allIds: [],
+          method: 'none'
+        };
+
+        var idSet = {};
+
+        try {
+          var pre = window.__PRELOADED_STATE__;
+          if (pre) {
+            out.method = 'preloaded_state';
+
+            if (pre.channel) {
+              out.channelUid = pre.channel.channelUid || pre.channel.id || '';
+              out.channelName = pre.channel.channelName || pre.channel.displayName || pre.channel.name || '';
+            }
+
+            if (pre.categoryProducts && Array.isArray(pre.categoryProducts.simpleProducts)) {
+              for (var i = 0; i < pre.categoryProducts.simpleProducts.length; i++) {
+                var p = pre.categoryProducts.simpleProducts[i];
+                if (typeof p === 'object' && p) {
+                  pushId(idSet, p.id);
+                  pushId(idSet, p.productId);
+                  pushId(idSet, p.productNo);
+                } else {
+                  pushId(idSet, p);
+                }
+              }
+            }
+
+            if (pre.homeSetting && pre.homeSetting.widgets) {
+              var wKeys = Object.keys(pre.homeSetting.widgets);
+              for (var wi = 0; wi < wKeys.length; wi++) {
+                var w = pre.homeSetting.widgets[wKeys[wi]];
+                if (w && Array.isArray(w.productNos)) {
+                  for (var pi = 0; pi < w.productNos.length; pi++) {
+                    pushId(idSet, w.productNos[pi]);
+                  }
+                }
+              }
+            }
+          }
+
+          var nextData = parseNextData();
+          if (nextData) {
+            if (out.method === 'none') out.method = 'next_data';
+
+            walk(nextData, function (node) {
+              if (!out.channelUid) {
+                out.channelUid =
+                  node.channelUid ||
+                  node.channelId ||
+                  node.channel_id ||
+                  '';
+              }
+              if (!out.channelName) {
+                out.channelName =
+                  node.channelName ||
+                  node.displayName ||
+                  node.channelDisplayName ||
+                  node.name ||
+                  '';
+              }
+
+              if (
+                node.id !== undefined ||
+                node.productId !== undefined ||
+                node.productNo !== undefined
+              ) {
+                pushId(idSet, node.id);
+                pushId(idSet, node.productId);
+                pushId(idSet, node.productNo);
+              }
+
+              if (Array.isArray(node.productNos)) {
+                for (var j = 0; j < node.productNos.length; j++) {
+                  pushId(idSet, node.productNos[j]);
+                }
+              }
+
+              if (Array.isArray(node.products)) {
+                for (var jj = 0; jj < node.products.length; jj++) {
+                  var pp = node.products[jj];
+                  if (pp && typeof pp === 'object') {
+                    pushId(idSet, pp.id);
+                    pushId(idSet, pp.productId);
+                    pushId(idSet, pp.productNo);
+                  }
+                }
+              }
+            }, 0);
+          }
+
+          var links = document.querySelectorAll('a[href*="/products/"]');
+          for (var li = 0; li < links.length; li++) {
+            var href = links[li].getAttribute('href') || '';
+            var m = href.match(/products\/(\d+)/);
+            if (m) idSet[m[1]] = true;
+          }
+
+          var cards = document.querySelectorAll('[data-product-no], [data-nclick*="product"], [data-shp-contents-id]');
+          for (var ci = 0; ci < cards.length; ci++) {
+            var pno1 = cards[ci].getAttribute('data-product-no');
+            var pno2 = cards[ci].getAttribute('data-shp-contents-id');
+            if (pno1) pushId(idSet, pno1);
+            if (pno2) pushId(idSet, pno2);
+          }
+
+          if (!out.channelName) {
+            var title = document.title || '';
+            if (title) {
+              out.channelName = title.split(':')[0].trim();
+            }
+          }
+
+          if (!out.channelUid) {
+            var scripts = document.querySelectorAll('script');
+            for (var si2 = 0; si2 < scripts.length; si2++) {
+              var txt = scripts[si2].textContent || '';
+              var uidMatch = txt.match(/"channelUid"\s*:\s*"([^"]+)"/);
+              if (uidMatch) {
+                out.channelUid = uidMatch[1];
+                break;
+              }
+            }
+          }
+
+          out.allIds = Object.keys(idSet);
+        } catch (e) {
+          out.method = 'error:' + e.message;
+        }
+
+        return out;
+      }, baseUrlRef);
+    }
+
+    var stateInfo = await extractStateInfo(page, baseUrl);
+
     var page2Ids = [];
     try {
       var p2 = await ctx.newPage();
       await p2.addInitScript(stealth);
-      await p2.goto(page2Url, { waitUntil: waitStrategy, timeout: 30000 });
-      await p2.waitForTimeout(2000);
-      page2Ids = await p2.evaluate(function() {
-        var ids = [];
-        try {
-          var state = window.__PRELOADED_STATE__;
-          if (state && state.categoryProducts && state.categoryProducts.simpleProducts) {
-            var sp = state.categoryProducts.simpleProducts;
-            for (var i = 0; i < sp.length; i++) {
-              var pid = typeof sp[i] === 'object' ? String(sp[i].id || '') : String(sp[i]);
-              if (pid) ids.push(pid);
-            }
-          }
-        } catch(e) {}
-        return ids;
+      await p2.goto(baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=2&size=80', {
+        waitUntil: storeType === 'smartstore' ? 'domcontentloaded' : 'networkidle',
+        timeout: 30000
       });
+      await p2.waitForTimeout(2500);
+      var page2State = await extractStateInfo(p2, baseUrl);
+      page2Ids = page2State.allIds || [];
       await p2.close();
-    } catch(e) { /* page 2 실패해도 무시 */ }
+    } catch (e) {}
 
-    var stateInfo = await page.evaluate(function() {
-      var out = { channelUid: '', channelName: '', allIds: [], method: 'none' };
-      try {
-        var state = window.__PRELOADED_STATE__;
-        if (!state) {
-          out.method = 'no_preloaded_state';
-          return out;
-        }
-        out.method = 'preloaded_state';
-        if (state.channel) {
-          if (state.channel.channelUid) out.channelUid = state.channel.channelUid;
-          // ★ 브랜드명 자동 추출
-          out.channelName = state.channel.channelName || state.channel.displayName || state.channel.name || '';
-        }
-        var idSet = {};
-        if (state.categoryProducts && state.categoryProducts.simpleProducts) {
-          var sp = state.categoryProducts.simpleProducts;
-          for (var i = 0; i < sp.length; i++) {
-            var pid = typeof sp[i] === 'object' ? String(sp[i].id || '') : String(sp[i]);
-            if (pid) idSet[pid] = true;
-          }
-        }
-        if (state.homeSetting && state.homeSetting.widgets) {
-          var wKeys = Object.keys(state.homeSetting.widgets);
-          for (var wi = 0; wi < wKeys.length; wi++) {
-            var w = state.homeSetting.widgets[wKeys[wi]];
-            if (w && w.productNos) {
-              for (var pi = 0; pi < w.productNos.length; pi++) idSet[String(w.productNos[pi])] = true;
-            }
-          }
-        }
-        var links = document.querySelectorAll('a[href*="/products/"]');
-        for (var li = 0; li < links.length; li++) {
-          var m = (links[li].getAttribute('href') || '').match(/products\/(\d+)/);
-          if (m) idSet[m[1]] = true;
-        }
-        out.allIds = Object.keys(idSet);
-      } catch(e) { out.method = 'error: ' + e.message; }
-      return out;
-    });
-
-    // ★ smartstore fallback: __PRELOADED_STATE__ 실패 시 DOM에서 직접 추출
-    if (stateInfo.allIds.length === 0 && storeType === 'smartstore') {
-      console.log('[v25] smartstore fallback: DOM scraping');
-      var domInfo = await page.evaluate(function(baseUrl) {
-        var out = { channelUid: '', channelName: '', allIds: [], method: 'dom_fallback' };
-        try {
-          // channelUid, channelName을 스크립트에서 추출 시도
-          var scripts = document.querySelectorAll('script');
-          for (var si = 0; si < scripts.length; si++) {
-            var txt = scripts[si].textContent || '';
-            var uidMatch = txt.match(/"channelUid"\s*:\s*"([^"]+)"/);
-            if (uidMatch && !out.channelUid) out.channelUid = uidMatch[1];
-            var nameMatch = txt.match(/"channelName"\s*:\s*"([^"]+)"/);
-            if (nameMatch && !out.channelName) out.channelName = nameMatch[1];
-            if (out.channelUid && out.channelName) break;
-          }
-          // title 태그에서도 브랜드명 추출 시도
-          if (!out.channelName) {
-            var title = document.title || '';
-            var colonIdx = title.indexOf(':');
-            if (colonIdx > 0) out.channelName = title.substring(0, colonIdx).trim();
-          }
-          // DOM에서 상품 링크 추출
-          var idSet = {};
-          var links = document.querySelectorAll('a[href*="/products/"]');
-          for (var li = 0; li < links.length; li++) {
-            var m = (links[li].getAttribute('href') || '').match(/products\/(\d+)/);
-            if (m) idSet[m[1]] = true;
-          }
-          // 이미지의 data-* 속성이나 product card에서도 시도
-          var cards = document.querySelectorAll('[data-product-no], [data-nclick*="product"]');
-          for (var ci = 0; ci < cards.length; ci++) {
-            var pno = cards[ci].getAttribute('data-product-no');
-            if (pno) idSet[pno] = true;
-          }
-          out.allIds = Object.keys(idSet);
-        } catch(e) { out.method = 'dom_error: ' + e.message; }
-        return out;
-      }, baseUrl);
-
-      if (domInfo.allIds.length > 0) {
-        stateInfo = domInfo;
-        if (domInfo.channelName) result.brand_name = domInfo.channelName;
-        console.log('[v25] DOM fallback found ' + domInfo.allIds.length + ' products');
-      }
-    }
-
-    // page2 ID 합치기
     for (var p2i = 0; p2i < page2Ids.length; p2i++) {
       if (stateInfo.allIds.indexOf(page2Ids[p2i]) === -1) {
         stateInfo.allIds.push(page2Ids[p2i]);
       }
     }
 
-    result.channel_uid = stateInfo.channelUid;
+    result.channel_uid = stateInfo.channelUid || '';
     result.brand_name = stateInfo.channelName || '';
+    result.debug.stateMethod = stateInfo.method;
     result.debug.totalIds = stateInfo.allIds.length;
     result.debug.page2Ids = page2Ids.length;
-    result.debug.stateMethod = stateInfo.method;
 
-    // ===== PHASE 2: simple-products API =====
-    // ★ v25.1: smartstore는 API 경로가 다름 + __PRELOADED_STATE__ fallback
+    // ===== PHASE 2: 상품 데이터 추출 =====
     var productMap = {};
     var productNoMap = {};
 
-    // ★ smartstore는 먼저 __PRELOADED_STATE__에서 직접 상품 데이터 추출 시도
-    if (storeType === 'smartstore') {
-      console.log('[v25] smartstore: extracting products from __PRELOADED_STATE__');
-      var stateProducts = await page.evaluate(function(baseUrl) {
-        var out = { products: [], productNoMap: {} };
-        try {
-          var state = window.__PRELOADED_STATE__;
-          if (!state) return out;
-
-          // categoryProducts.simpleProducts에 상품 객체가 있는 경우
-          var sp = (state.categoryProducts && state.categoryProducts.simpleProducts) || [];
-          for (var i = 0; i < sp.length; i++) {
-            var p = sp[i];
-            if (typeof p !== 'object' || !p) continue;
-            var pid = String(p.id || '');
-            if (!pid) continue;
-            var rc = 0;
-            if (p.reviewAmount && typeof p.reviewAmount === 'object') {
-              rc = p.reviewAmount.totalReviewCount || 0;
-            }
-            var dp = null;
-            if (p.benefitsView && p.benefitsView.discountedSalePrice) {
-              dp = p.benefitsView.discountedSalePrice;
-            }
-            var pno = String(p.productNo || '');
-            if (pno) out.productNoMap[pid] = pno;
-            out.products.push({
-              product_id: pid,
-              product_name: p.name || p.dispName || '',
-              sale_price: p.salePrice || 0,
-              discount_price: dp,
-              review_count: rc,
-              product_image_url: (p.representativeImageUrl || '').split('?')[0],
-              category_name: p.category ? (p.category.wholeCategoryName || '') : '',
-              is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
-              product_url: baseUrl + '/products/' + pid,
-              productNo: pno
-            });
-          }
-
-          // products 객체에서도 시도 (다른 state 구조)
-          if (out.products.length === 0 && state.products) {
-            var pKeys = Object.keys(state.products);
-            for (var pi = 0; pi < pKeys.length; pi++) {
-              var pp = state.products[pKeys[pi]];
-              if (!pp || typeof pp !== 'object') continue;
-              var ppid = String(pp.id || pp.productId || pKeys[pi]);
-              var prc = 0;
-              if (pp.reviewAmount) prc = pp.reviewAmount.totalReviewCount || 0;
-              var pdp = null;
-              if (pp.benefitsView && pp.benefitsView.discountedSalePrice) pdp = pp.benefitsView.discountedSalePrice;
-              var ppno = String(pp.productNo || '');
-              if (ppno) out.productNoMap[ppid] = ppno;
-              out.products.push({
-                product_id: ppid,
-                product_name: pp.name || pp.dispName || '',
-                sale_price: pp.salePrice || 0,
-                discount_price: pdp,
-                review_count: prc,
-                product_image_url: (pp.representativeImageUrl || '').split('?')[0],
-                category_name: '',
-                is_sold_out: (pp.productStatusType === 'OUTOFSTOCK') || (pp.soldout === true) || false,
-                product_url: baseUrl + '/products/' + ppid,
-                productNo: ppno
-              });
-            }
-          }
-        } catch(e) {}
-        return out;
-      }, baseUrl);
-
-      console.log('[v25] smartstore state products: ' + stateProducts.products.length);
-
-      if (stateProducts.products.length > 0) {
-        for (var spi = 0; spi < stateProducts.products.length; spi++) {
-          var sp = stateProducts.products[spi];
-          productMap[sp.product_id] = {
-            product_id: sp.product_id,
-            product_name: sp.product_name,
-            sale_price: sp.sale_price,
-            discount_price: sp.discount_price,
-            review_count: sp.review_count,
-            purchase_count_today: 0, purchase_text_today: '', purchase_prefix_today: '',
-            purchase_count_weekly: 0, purchase_text_weekly: '', purchase_prefix_weekly: '',
-            product_image_url: sp.product_image_url,
-            category_name: sp.category_name,
-            is_sold_out: sp.is_sold_out,
-            product_url: sp.product_url
-          };
-          if (sp.productNo) productNoMap[sp.product_id] = sp.productNo;
+    async function extractProductsFromState(pageRef, baseUrlRef) {
+      return await pageRef.evaluate(function (baseUrlInner) {
+        function s(v) {
+          return v === null || v === undefined ? '' : String(v);
         }
-        Object.assign(productNoMap, stateProducts.productNoMap);
-      }
+
+        function parseNextData() {
+          try {
+            if (window.__NEXT_DATA__) return window.__NEXT_DATA__;
+            var el = document.getElementById('__NEXT_DATA__');
+            if (el && el.textContent) return JSON.parse(el.textContent);
+          } catch (e) {}
+          return null;
+        }
+
+        function addProduct(out, raw) {
+          if (!raw || typeof raw !== 'object') return;
+
+          var pid = s(raw.id || raw.productId || '');
+          var pno = s(raw.productNo || '');
+          if (!pid && !pno) return;
+
+          var finalId = pid || pno;
+          var reviewCount = 0;
+          if (raw.reviewAmount && typeof raw.reviewAmount === 'object') {
+            reviewCount = raw.reviewAmount.totalReviewCount || 0;
+          } else if (raw.reviewCount) {
+            reviewCount = raw.reviewCount;
+          }
+
+          var discountPrice = null;
+          if (raw.benefitsView && raw.benefitsView.discountedSalePrice) {
+            discountPrice = raw.benefitsView.discountedSalePrice;
+          } else if (raw.discountedSalePrice) {
+            discountPrice = raw.discountedSalePrice;
+          }
+
+          out.products[finalId] = {
+            product_id: finalId,
+            product_name: raw.name || raw.dispName || raw.productName || '',
+            sale_price: raw.salePrice || raw.salePriceValue || 0,
+            discount_price: discountPrice,
+            review_count: reviewCount,
+            product_image_url: s(raw.representativeImageUrl || raw.imageUrl || raw.productImageUrl || '').split('?')[0],
+            category_name: raw.category ? (raw.category.wholeCategoryName || raw.category.name || '') : '',
+            is_sold_out: !!(
+              raw.productStatusType === 'OUTOFSTOCK' ||
+              raw.soldout === true ||
+              raw.isSoldOut === true
+            ),
+            product_url: baseUrlInner + '/products/' + finalId,
+            productNo: pno
+          };
+
+          if (pno) out.productNoMap[finalId] = pno;
+        }
+
+        function walk(obj, visitor, depth) {
+          if (!obj || depth > 8) return;
+          if (Array.isArray(obj)) {
+            for (var i = 0; i < obj.length; i++) walk(obj[i], visitor, depth + 1);
+            return;
+          }
+          if (typeof obj !== 'object') return;
+          visitor(obj);
+          var keys = Object.keys(obj);
+          for (var k = 0; k < keys.length; k++) {
+            walk(obj[keys[k]], visitor, depth + 1);
+          }
+        }
+
+        var out = { products: {}, productNoMap: {}, source: 'none' };
+
+        try {
+          var pre = window.__PRELOADED_STATE__;
+          if (pre) {
+            out.source = 'preloaded_state';
+
+            var sp = (pre.categoryProducts && pre.categoryProducts.simpleProducts) || [];
+            for (var i = 0; i < sp.length; i++) {
+              if (typeof sp[i] === 'object' && sp[i]) addProduct(out, sp[i]);
+            }
+
+            if (pre.products && typeof pre.products === 'object') {
+              var pKeys = Object.keys(pre.products);
+              for (var pi = 0; pi < pKeys.length; pi++) {
+                addProduct(out, pre.products[pKeys[pi]]);
+              }
+            }
+          }
+
+          var nextData = parseNextData();
+          if (nextData) {
+            if (out.source === 'none') out.source = 'next_data';
+
+            walk(nextData, function (node) {
+              var hasProductShape =
+                (node && typeof node === 'object') &&
+                (
+                  node.id !== undefined ||
+                  node.productId !== undefined ||
+                  node.productNo !== undefined
+                ) &&
+                (
+                  node.name !== undefined ||
+                  node.dispName !== undefined ||
+                  node.productName !== undefined ||
+                  node.salePrice !== undefined
+                );
+
+              if (hasProductShape) addProduct(out, node);
+
+              if (Array.isArray(node.products)) {
+                for (var j = 0; j < node.products.length; j++) {
+                  if (node.products[j] && typeof node.products[j] === 'object') {
+                    addProduct(out, node.products[j]);
+                  }
+                }
+              }
+
+              if (Array.isArray(node.simpleProducts)) {
+                for (var jj = 0; jj < node.simpleProducts.length; jj++) {
+                  if (node.simpleProducts[jj] && typeof node.simpleProducts[jj] === 'object') {
+                    addProduct(out, node.simpleProducts[jj]);
+                  }
+                }
+              }
+            }, 0);
+          }
+        } catch (e) {}
+
+        return out;
+      }, baseUrlRef);
     }
 
-    // ★ brand store이거나, smartstore에서 state 추출 실패 시 API 호출
+    var stateProducts = await extractProductsFromState(page, baseUrl);
+    result.debug.stateProductSource = stateProducts.source;
+
+    var stateProductKeys = Object.keys(stateProducts.products || {});
+    for (var spi = 0; spi < stateProductKeys.length; spi++) {
+      var key = stateProductKeys[spi];
+      var sp = stateProducts.products[key];
+      productMap[key] = {
+        product_id: sp.product_id,
+        product_name: sp.product_name,
+        sale_price: sp.sale_price,
+        discount_price: sp.discount_price,
+        review_count: sp.review_count,
+        purchase_count_today: 0,
+        purchase_text_today: '',
+        purchase_prefix_today: '',
+        purchase_count_weekly: 0,
+        purchase_text_weekly: '',
+        purchase_prefix_weekly: '',
+        product_image_url: sp.product_image_url,
+        category_name: sp.category_name,
+        is_sold_out: sp.is_sold_out,
+        product_url: sp.product_url
+      };
+      if (sp.productNo) productNoMap[key] = sp.productNo;
+    }
+
+    var pnoKeys = Object.keys(stateProducts.productNoMap || {});
+    for (var pk = 0; pk < pnoKeys.length; pk++) {
+      productNoMap[pnoKeys[pk]] = stateProducts.productNoMap[pnoKeys[pk]];
+    }
+
+    // state에서 못 가져온 경우 API fallback
     if (Object.keys(productMap).length === 0 && stateInfo.channelUid && stateInfo.allIds.length > 0) {
-      // smartstore는 여러 API 경로 시도
       var apiPaths = (storeType === 'smartstore')
-        ? ['/i/v2/channels/', '/i/v1/channels/', '/n/v2/channels/']
-        : ['/n/v2/channels/'];
+        ? ['/i/v2/channels/', '/i/v1/channels/', '/n/v2/channels/', '/n/v1/channels/']
+        : ['/n/v2/channels/', '/n/v1/channels/'];
 
       var batchSize = 20;
+
       for (var pathIdx = 0; pathIdx < apiPaths.length; pathIdx++) {
         var currentPath = apiPaths[pathIdx];
         var pathWorked = false;
+        var localCount = 0;
 
         for (var bi = 0; bi < stateInfo.allIds.length; bi += batchSize) {
           var batch = stateInfo.allIds.slice(bi, bi + batchSize);
+
           try {
-            var apiResult = await page.evaluate(function(args) {
-              var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
-              var url = args.apiBase + args.path + args.uid + '/simple-products?' + qs
-                + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
+            var apiResult = await page.evaluate(function (args) {
+              var qs = args.ids.map(function (id) {
+                return 'ids[]=' + encodeURIComponent(id);
+              }).join('&');
+
+              var url =
+                args.apiBase +
+                args.path +
+                args.uid +
+                '/simple-products?' +
+                qs +
+                '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
+
               return fetch(url, { credentials: 'include' })
-                .then(function(r) { return r.ok ? r.json() : { _failed: true, _status: r.status }; })
-                .catch(function(e) { return { _failed: true, _error: String(e) }; });
-            }, { uid: stateInfo.channelUid, ids: batch, apiBase: apiBase, path: currentPath });
+                .then(function (r) {
+                  if (!r.ok) return { _failed: true, _status: r.status, _url: url };
+                  return r.json();
+                })
+                .catch(function (e) {
+                  return { _failed: true, _error: String(e), _url: url };
+                });
+            }, {
+              uid: stateInfo.channelUid,
+              ids: batch,
+              apiBase: apiBase,
+              path: currentPath
+            });
 
             if (apiResult && apiResult._failed) {
-              console.log('[v25] API path ' + currentPath + ' failed: ' + (apiResult._status || apiResult._error));
-              break; // 이 경로는 실패, 다음 경로 시도
+              if (bi === 0) {
+                console.log('[v28] API path failed: ' + currentPath + ' / ' + (apiResult._status || apiResult._error));
+              }
+              break;
             }
 
             if (Array.isArray(apiResult)) {
               pathWorked = true;
+
               for (var ai = 0; ai < apiResult.length; ai++) {
                 var p = apiResult[ai];
-                var pid = String(p.id || '');
+                var pid = String(p.id || p.productId || p.productNo || '');
                 if (!pid) continue;
+
                 var rc = 0;
-                if (p.reviewAmount && typeof p.reviewAmount === 'object') rc = p.reviewAmount.totalReviewCount || 0;
+                if (p.reviewAmount && typeof p.reviewAmount === 'object') {
+                  rc = p.reviewAmount.totalReviewCount || 0;
+                } else if (p.reviewCount) {
+                  rc = p.reviewCount;
+                }
+
                 var dp = null;
-                if (p.benefitsView && p.benefitsView.discountedSalePrice) dp = p.benefitsView.discountedSalePrice;
+                if (p.benefitsView && p.benefitsView.discountedSalePrice) {
+                  dp = p.benefitsView.discountedSalePrice;
+                } else if (p.discountedSalePrice) {
+                  dp = p.discountedSalePrice;
+                }
+
                 var pno = String(p.productNo || '');
-                if (pno) productNoMap[pid] = pno;
 
                 productMap[pid] = {
                   product_id: pid,
-                  product_name: p.name || p.dispName || '',
+                  product_name: p.name || p.dispName || p.productName || '',
                   sale_price: p.salePrice || 0,
                   discount_price: dp,
                   review_count: rc,
-                  purchase_count_today: 0, purchase_text_today: '', purchase_prefix_today: '',
-                  purchase_count_weekly: 0, purchase_text_weekly: '', purchase_prefix_weekly: '',
-                  product_image_url: (p.representativeImageUrl || '').split('?')[0],
-                  category_name: p.category ? (p.category.wholeCategoryName || '') : '',
-                  is_sold_out: (p.productStatusType === 'OUTOFSTOCK') || (p.soldout === true) || false,
+                  purchase_count_today: 0,
+                  purchase_text_today: '',
+                  purchase_prefix_today: '',
+                  purchase_count_weekly: 0,
+                  purchase_text_weekly: '',
+                  purchase_prefix_weekly: '',
+                  product_image_url: (String(p.representativeImageUrl || p.imageUrl || '')).split('?')[0],
+                  category_name: p.category ? (p.category.wholeCategoryName || p.category.name || '') : '',
+                  is_sold_out: !!(p.productStatusType === 'OUTOFSTOCK' || p.soldout === true || p.isSoldOut === true),
                   product_url: baseUrl + '/products/' + pid
                 };
+
+                if (pno) productNoMap[pid] = pno;
+                localCount++;
               }
             }
-          } catch(e) {}
-          if (bi + batchSize < stateInfo.allIds.length) await page.waitForTimeout(200);
+          } catch (e) {}
+
+          if (bi + batchSize < stateInfo.allIds.length) {
+            await page.waitForTimeout(200);
+          }
         }
 
-        if (pathWorked) {
-          console.log('[v25] API path worked: ' + currentPath + ', products: ' + Object.keys(productMap).length);
+        if (pathWorked && localCount > 0) {
           result.debug.apiPathUsed = currentPath;
+          console.log('[v28] API path worked: ' + currentPath + ', products=' + localCount);
           break;
         }
       }
@@ -381,136 +592,218 @@ async function scrape(params) {
     result.debug.apiProducts = Object.keys(productMap).length;
     result.debug.productNoMapped = Object.keys(productNoMap).length;
 
-    // ===== PHASE 3: marketing-message API =====
-    // ★★★ v26: basis 패턴 완전 해독!
-    // basis=1 → "오늘 N명 구매" (오늘 데이터)
-    // basis=(N+1) → "최근 1주간 M명 구매" (주간 데이터)
-    // 오늘 구매 없으면 basis=1에서 바로 "최근 1주간" 반환
-    // → 상품당 정확히 1~2회만 호출! ★★★
-    var purchaseDebug = { total: 0, todayCount: 0, weeklyCount: 0, ignoredCumul: 0, errors: [], samples: [] };
+    // ===== PHASE 3: marketing-message =====
+    var purchaseDebug = {
+      total: 0,
+      todayCount: 0,
+      weeklyCount: 0,
+      ignored: 0,
+      skippedNoProductNo: 0,
+      errors: [],
+      samples: []
+    };
+
     var allPids = Object.keys(productMap);
-    console.log('[v26] P3: marketing-message for ' + allPids.length + ' products');
+    console.log('[v28] P3 marketing-message total=' + allPids.length);
 
     var msgApiPath = (storeType === 'smartstore') ? '/i/v1/marketing-message/' : '/n/v1/marketing-message/';
     var msgApiFallback = '/n/v1/marketing-message/';
 
     async function callMsg(pageRef, id, basis, apiPath) {
-      return await pageRef.evaluate(function(args) {
-        var url = args.apiBase + args.path + args.id
-          + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
-          + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + args.basis;
+      return await pageRef.evaluate(function (args) {
+        var url =
+          args.apiBase +
+          args.path +
+          args.id +
+          '?currentPurchaseType=Paid' +
+          '&usePurchased=true' +
+          '&basisPurchased=1' +
+          '&usePurchasedIn2Y=true' +
+          '&useRepurchased=true' +
+          '&basisRepurchased=' + args.basis;
+
         return fetch(url, { credentials: 'include' })
-          .then(function(r) {
-            if (!r.ok) return { ok: false, status: r.status };
-            return r.json().then(function(data) { return { ok: true, data: data }; });
+          .then(function (r) {
+            if (!r.ok) return { ok: false, status: r.status, url: url };
+            return r.json().then(function (data) {
+              return { ok: true, data: data, url: url };
+            });
           })
-          .catch(function(e) { return { ok: false, error: String(e) }; });
-      }, { id: id, basis: basis, apiBase: apiBase, path: apiPath });
+          .catch(function (e) {
+            return { ok: false, error: String(e), url: url };
+          });
+      }, {
+        id: id,
+        basis: basis,
+        apiBase: apiBase,
+        path: apiPath
+      });
     }
 
-    function parseMsg(result) {
-      if (!result || !result.ok || !result.data) return null;
-      var phrase = result.data.mainPhrase || '';
-      var prefix = (result.data.prefix || '').trim();
-      var count = 0;
-      var nm = phrase.match(/(\d[\d,]*)\s*\uBA85/);
-      if (nm) count = parseInt(nm[1].replace(/,/g, ''));
-      return { count: count, phrase: phrase, prefix: prefix };
+    async function callMsgWithFallback(pageRef, id, basis) {
+      var r = await callMsg(pageRef, id, basis, msgApiPath);
+      if (storeType === 'smartstore' && (!r || !r.ok)) {
+        r = await callMsg(pageRef, id, basis, msgApiFallback);
+      }
+      return r;
+    }
+
+    function normalizeText(s) {
+      return String(s || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function extractCount(text) {
+      var t = normalizeText(text);
+      var m = t.match(/(\d[\d,]*)\s*명/);
+      if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+
+      m = t.match(/(\d[\d,]*)\s*건/);
+      if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+
+      return 0;
+    }
+
+    function parseMsg(resultObj) {
+      if (!resultObj || !resultObj.ok || !resultObj.data) return null;
+
+      var prefix = normalizeText(resultObj.data.prefix || '');
+      var phrase = normalizeText(resultObj.data.mainPhrase || '');
+      var fullText = normalizeText(prefix + ' ' + phrase);
+
+      var count = extractCount(phrase);
+      if (!count) count = extractCount(fullText);
+
+      return {
+        prefix: prefix,
+        phrase: phrase,
+        fullText: fullText,
+        count: count,
+        isToday: /오늘/.test(prefix) || /오늘/.test(fullText),
+        isWeekly: /최근\s*1주/.test(prefix) || /최근\s*1주/.test(fullText)
+      };
     }
 
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
-      var msgId = productNoMap[prodId] || prodId;
+      var msgId = productNoMap[prodId];
+
       purchaseDebug.total++;
 
-      // ★ Step 1: basis=1 호출
-      var r1 = await callMsg(page, msgId, 1, msgApiPath);
-
-      // smartstore fallback
-      if (storeType === 'smartstore' && (!r1 || !r1.ok)) {
-        r1 = await callMsg(page, msgId, 1, msgApiFallback);
-      }
-
-      var p1 = parseMsg(r1);
-
-      if (!p1 || p1.count === 0) {
-        // 데이터 없음
-        purchaseDebug.ignoredCumul++;
-        if (purchaseDebug.samples.length < 8) {
-          purchaseDebug.samples.push({ pid: prodId, msgId: msgId, step1: 'no_data', today: 0, weekly: 0 });
+      // 스마트스토어는 productNo 없으면 억지로 product_id 쓰지 않음
+      if (storeType === 'smartstore' && !msgId) {
+        purchaseDebug.skippedNoProductNo++;
+        if (purchaseDebug.errors.length < 20) {
+          purchaseDebug.errors.push({
+            pid: prodId,
+            reason: 'productNo missing for smartstore marketing-message'
+          });
         }
-        if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
         continue;
       }
 
-      if (p1.prefix.indexOf('\uC624\uB298') > -1) {
-        // ★ "오늘" → 오늘 데이터 저장
-        productMap[prodId].purchase_count_today = p1.count;
-        productMap[prodId].purchase_text_today = p1.phrase;
-        productMap[prodId].purchase_prefix_today = p1.prefix;
-        purchaseDebug.todayCount++;
+      // 브랜드스토어는 productNo 없으면 id fallback 허용
+      if (!msgId) msgId = prodId;
 
-        // ★ Step 2: basis=(오늘count + 1) → 주간 데이터
-        var weeklyBasis = p1.count + 1;
-        var r2 = await callMsg(page, msgId, weeklyBasis, msgApiPath);
-        if (storeType === 'smartstore' && (!r2 || !r2.ok)) {
-          r2 = await callMsg(page, msgId, weeklyBasis, msgApiFallback);
+      var r1 = await callMsgWithFallback(page, msgId, 1);
+      var p1 = parseMsg(r1);
+
+      if (!p1 || !p1.count) {
+        purchaseDebug.ignored++;
+        if (purchaseDebug.samples.length < 10) {
+          purchaseDebug.samples.push({
+            pid: prodId,
+            msgId: msgId,
+            step1: r1
+          });
         }
-        var p2 = parseMsg(r2);
+        if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(250);
+        continue;
+      }
 
-        if (p2 && p2.count > 0 && p2.prefix.indexOf('\uCD5C\uADFC') > -1) {
-          productMap[prodId].purchase_count_weekly = p2.count;
-          productMap[prodId].purchase_text_weekly = p2.phrase;
-          productMap[prodId].purchase_prefix_weekly = p2.prefix;
-          purchaseDebug.weeklyCount++;
-        } else if (p2 && p2.count > 0) {
-          // prefix가 "최근"이 아닌 경우도 주간으로 취급
-          productMap[prodId].purchase_count_weekly = p2.count;
-          productMap[prodId].purchase_text_weekly = p2.phrase;
-          productMap[prodId].purchase_prefix_weekly = p2.prefix || 'basis:' + weeklyBasis;
-          purchaseDebug.weeklyCount++;
-        }
-
-      } else if (p1.prefix.indexOf('\uCD5C\uADFC') > -1) {
-        // ★ basis=1에서 바로 "최근 1주간" → 오늘 구매 없음, 주간만 저장
+      // basis=1 에서 바로 최근 1주
+      if (p1.isWeekly) {
         productMap[prodId].purchase_count_weekly = p1.count;
         productMap[prodId].purchase_text_weekly = p1.phrase;
         productMap[prodId].purchase_prefix_weekly = p1.prefix;
         purchaseDebug.weeklyCount++;
 
-      } else if (p1.prefix === '' && p1.phrase.indexOf('\uC774\uC0C1') === -1) {
-        // prefix 없고 "이상" 아님 → 주간 fallback
-        productMap[prodId].purchase_count_weekly = p1.count;
-        productMap[prodId].purchase_text_weekly = p1.phrase;
-        productMap[prodId].purchase_prefix_weekly = 'auto:basis1';
-        purchaseDebug.weeklyCount++;
+        if (purchaseDebug.samples.length < 10) {
+          purchaseDebug.samples.push({
+            pid: prodId,
+            msgId: msgId,
+            step1: p1,
+            today: 0,
+            weekly: p1.count
+          });
+        }
+        continue;
+      }
+
+      // basis=1 이 오늘
+      if (p1.isToday) {
+        productMap[prodId].purchase_count_today = p1.count;
+        productMap[prodId].purchase_text_today = p1.phrase;
+        productMap[prodId].purchase_prefix_today = p1.prefix;
+        purchaseDebug.todayCount++;
+
+        var weeklyBasisCandidates = [p1.count + 1, p1.count + 2, p1.count];
+        var weeklySaved = false;
+
+        for (var bi2 = 0; bi2 < weeklyBasisCandidates.length; bi2++) {
+          var wb = weeklyBasisCandidates[bi2];
+          if (wb < 1) continue;
+
+          var r2 = await callMsgWithFallback(page, msgId, wb);
+          var p2 = parseMsg(r2);
+
+          if (p2 && p2.count > 0 && p2.isWeekly) {
+            productMap[prodId].purchase_count_weekly = p2.count;
+            productMap[prodId].purchase_text_weekly = p2.phrase;
+            productMap[prodId].purchase_prefix_weekly = p2.prefix || ('basis:' + wb);
+            purchaseDebug.weeklyCount++;
+            weeklySaved = true;
+            break;
+          }
+        }
+
+        if (purchaseDebug.samples.length < 10) {
+          purchaseDebug.samples.push({
+            pid: prodId,
+            msgId: msgId,
+            step1: p1,
+            today: productMap[prodId].purchase_count_today,
+            weekly: productMap[prodId].purchase_count_weekly,
+            weeklySaved: weeklySaved
+          });
+        }
       } else {
-        purchaseDebug.ignoredCumul++;
+        purchaseDebug.ignored++;
+        if (purchaseDebug.samples.length < 10) {
+          purchaseDebug.samples.push({
+            pid: prodId,
+            msgId: msgId,
+            step1: p1,
+            reason: 'unknown prefix'
+          });
+        }
       }
 
-      if (purchaseDebug.samples.length < 8) {
-        purchaseDebug.samples.push({
-          pid: prodId, msgId: msgId,
-          step1: p1 ? { pfx: p1.prefix, phrase: p1.phrase, count: p1.count } : 'fail',
-          today: productMap[prodId].purchase_count_today,
-          weekly: productMap[prodId].purchase_count_weekly
-        });
+      if (mi > 0 && mi % 10 === 0) {
+        await page.waitForTimeout(250);
       }
-
-      // 10개 상품마다 200ms 대기 (가벼워서 간격 줄임)
-      if (mi > 0 && mi % 10 === 0) await page.waitForTimeout(200);
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v26] P3: today=' + purchaseDebug.todayCount + ', weekly=' + purchaseDebug.weeklyCount + ', ignored=' + purchaseDebug.ignoredCumul);
 
-    // ===== PHASE 4: 결과 =====
+    // ===== PHASE 4: 결과 정리 =====
     var pids = Object.keys(productMap);
     for (var fi = 0; fi < pids.length; fi++) {
       var prod = productMap[pids[fi]];
       result.data.push({
-        product_id: prod.product_id, product_name: prod.product_name,
-        sale_price: prod.sale_price, discount_price: prod.discount_price,
+        product_id: prod.product_id,
+        product_name: prod.product_name,
+        sale_price: prod.sale_price,
+        discount_price: prod.discount_price,
         review_count: prod.review_count,
         purchase_count_today: prod.purchase_count_today,
         purchase_text_today: prod.purchase_text_today,
@@ -518,53 +811,104 @@ async function scrape(params) {
         purchase_count_weekly: prod.purchase_count_weekly,
         purchase_text_weekly: prod.purchase_text_weekly,
         purchase_prefix_weekly: prod.purchase_prefix_weekly,
-        product_image_url: prod.product_image_url, category_name: prod.category_name,
-        is_sold_out: prod.is_sold_out, product_url: prod.product_url
+        product_image_url: prod.product_image_url,
+        category_name: prod.category_name,
+        is_sold_out: prod.is_sold_out,
+        product_url: prod.product_url
       });
     }
 
     result.debug.total = result.data.length;
-    if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
+
+    if (result.data.length === 0) {
+      result.status = 'EMPTY';
+      result.error = 'No products found';
+    }
   } catch (e) {
     result.status = 'ERROR';
     result.error = e.message || String(e);
   } finally {
-    try { if (page) await page.close(); } catch(x) {}
-    try { if (ctx) await ctx.close(); } catch(x) {}
+    try { if (page) await page.close(); } catch (x) {}
+    try { if (ctx) await ctx.close(); } catch (x) {}
   }
+
   return result;
 }
 
-// ============ SPY ============
 async function spy(params) {
   var url = params.url || 'https://brand.naver.com/dcurvin/products/12569074482';
-  var br = null; var ctx = null; var page = null; var captured = [];
+  var br = null;
+  var ctx = null;
+  var page = null;
+  var captured = [];
+
   try {
-    br = await getBrowser(); ctx = await br.newContext(ctxOpts()); page = await ctx.newPage();
-    page.on('response', async function(response) {
+    br = await getBrowser();
+    ctx = await br.newContext(ctxOpts());
+    page = await ctx.newPage();
+
+    page.on('response', async function (response) {
       try {
-        var reqUrl = response.url(); var ct = response.headers()['content-type'] || '';
+        var reqUrl = response.url();
+        var ct = response.headers()['content-type'] || '';
         if (ct.indexOf('json') > -1 && response.status() === 200) {
           var body = await response.text();
-          captured.push({ url: reqUrl.length > 200 ? reqUrl.slice(0, 200) + '...' : reqUrl, status: response.status(), size: body.length, snippet: body.slice(0, 500) });
+          captured.push({
+            url: reqUrl.length > 240 ? reqUrl.slice(0, 240) + '...' : reqUrl,
+            status: response.status(),
+            size: body.length,
+            snippet: body.slice(0, 500)
+          });
         }
-      } catch(e) {}
+      } catch (e) {}
     });
+
     await page.addInitScript(stealth);
     await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
     await page.waitForTimeout(3000);
-    return { status: 'OK', url: url, captured_count: captured.length, captured: captured };
-  } catch(e) { return { status: 'ERROR', error: e.message, captured: captured };
-  } finally { try { if (page) await page.close(); } catch(x) {} try { if (ctx) await ctx.close(); } catch(x) {} }
+
+    return {
+      status: 'OK',
+      url: url,
+      captured_count: captured.length,
+      captured: captured
+    };
+  } catch (e) {
+    return {
+      status: 'ERROR',
+      error: e.message,
+      captured: captured
+    };
+  } finally {
+    try { if (page) await page.close(); } catch (x) {}
+    try { if (ctx) await ctx.close(); } catch (x) {}
+  }
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v27] action=' + action);
+  console.log('[naver_store v28] action=' + action);
+
   try {
-    if (action === 'scrape') return res.json(await scrape(req.body));
-    if (action === 'spy') return res.json(await spy(req.body));
-    return res.status(400).json({ status: 'ERROR', message: 'Unknown action: ' + action });
-  } catch(e) { if (!res.headersSent) return res.status(500).json({ status: 'ERROR', error: e.message || String(e) }); }
+    if (action === 'scrape') {
+      return res.json(await scrape(req.body));
+    }
+
+    if (action === 'spy') {
+      return res.json(await spy(req.body));
+    }
+
+    return res.status(400).json({
+      status: 'ERROR',
+      message: 'Unknown action: ' + action
+    });
+  } catch (e) {
+    if (!res.headersSent) {
+      return res.status(500).json({
+        status: 'ERROR',
+        error: e.message || String(e)
+      });
+    }
+  }
 }
 
 module.exports = { execute };
