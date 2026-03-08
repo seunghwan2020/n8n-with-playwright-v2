@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v34_pagination',
-    debug: { build: 'V34_PAGINATION', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v34_fullscan',
+    debug: { build: 'V34_FULLSCAN', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -65,9 +65,9 @@ async function scrape(params) {
     
 
     // ===== PHASE 1: 상품 ID 수집 =====
-    // ★ v34: size=40 (네이버 내부 pageSize와 일치) + 3페이지 수집
-    var pageSize = 40;
-    var maxPages = 3; // 40 x 3 = 최대 120개 상품 커버
+    // ★ v34: size=80으로 최대한 많이 가져오기 + page 2,3 수집 강화
+    var pageSize = 80;
+    var maxPages = 3; // 80 x 3 = 최대 240개 상품 커버
     var waitStrategy = (storeType === 'smartstore') ? 'domcontentloaded' : 'networkidle';
 
     // ★ page 1 로드 (메인 페이지 — channelUid, channelName 추출용)
@@ -256,6 +256,45 @@ async function scrape(params) {
         console.log('[v34] smartstore: brand page open failed, using original page');
         apiPage = page; // 실패하면 원래 페이지 사용
       }
+    }
+
+    // ★ PHASE 1.5: 채널 상품 API로 전체 상품 ID 누락 보완
+    // HTML 스크래핑만으로는 상품 누락 발생 → API pagination으로 전체 ID 확보
+    if (stateInfo.channelUid) {
+      var beforeCount = stateInfo.allIds.length;
+      try {
+        for (var apiPg = 1; apiPg <= 5; apiPg++) {
+          var productsResult = await apiPage.evaluate(function(args) {
+            var url = args.apiBase + '/n/v2/channels/' + args.uid + '/products'
+              + '?categorySearchType=DISPCATG&sortType=POPULAR&page=' + args.page + '&pageSize=80';
+            return fetch(url, { credentials: 'include' })
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .catch(function() { return null; });
+          }, { uid: stateInfo.channelUid, apiBase: apiBase, page: apiPg });
+
+          if (!productsResult || !Array.isArray(productsResult.simpleProducts) || productsResult.simpleProducts.length === 0) {
+            break;
+          }
+
+          var newCount = 0;
+          for (var pri = 0; pri < productsResult.simpleProducts.length; pri++) {
+            var sp = productsResult.simpleProducts[pri];
+            var spid = String(typeof sp === 'object' ? (sp.id || '') : sp);
+            if (spid && stateInfo.allIds.indexOf(spid) === -1) {
+              stateInfo.allIds.push(spid);
+              newCount++;
+            }
+          }
+          console.log('[v34] PHASE 1.5: API page ' + apiPg + ' → ' + productsResult.simpleProducts.length + ' products, ' + newCount + ' new');
+          if (productsResult.simpleProducts.length < 80) break;
+          await apiPage.waitForTimeout(300);
+        }
+      } catch(e) {
+        console.log('[v34] PHASE 1.5 error: ' + (e.message || '').substring(0, 50));
+      }
+      result.debug.phase15_added = stateInfo.allIds.length - beforeCount;
+      result.debug.totalIds = stateInfo.allIds.length;
+      console.log('[v34] PHASE 1.5: ' + beforeCount + ' → ' + stateInfo.allIds.length + ' IDs');
     }
 
     // ===== PHASE 2: simple-products API =====
@@ -454,8 +493,21 @@ async function scrape(params) {
 
     var purchaseDebug = { total: 0, todayOk: 0, weeklyOk: 0, skipped: 0, errors: [] };
     var allPids = Object.keys(productMap);
-    var msgApiPath = '/n/v1/marketing-message/';
-    console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품');
+
+    // ★ v34: 스마트스토어는 API 경로와 호출 페이지가 다름!
+    // brand store:  brand.naver.com/n/v1/marketing-message/{id} (apiPage에서 호출)
+    // smartstore:   smartstore.naver.com/i/v1/marketing-message/{id} (원래 page에서 호출)
+    var msgApiBase, msgApiPath, msgPage;
+    if (storeType === 'smartstore') {
+      msgApiBase = 'https://smartstore.naver.com';
+      msgApiPath = '/i/v1/marketing-message/';
+      msgPage = page; // smartstore 원래 페이지에서 호출 (CORS 방지)
+    } else {
+      msgApiBase = apiBase; // brand.naver.com
+      msgApiPath = '/n/v1/marketing-message/';
+      msgPage = apiPage;
+    }
+    console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품, msgBase=' + msgApiBase + msgApiPath);
 
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
@@ -463,9 +515,9 @@ async function scrape(params) {
       purchaseDebug.total++;
 
       try {
-        var result33 = await apiPage.evaluate(function(args) {
+        var result33 = await msgPage.evaluate(function(args) {
           function buildUrl(basisPurchased) {
-            return args.apiBase + args.path + args.id
+            return args.msgApiBase + args.path + args.id
               + '?currentPurchaseType=Paid'
               + '&usePurchased=true&basisPurchased=' + basisPurchased
               + '&usePurchasedIn2Y=true'
@@ -558,7 +610,7 @@ async function scrape(params) {
             return out;
           });
 
-        }, { id: msgId, apiBase: apiBase, path: msgApiPath });
+        }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath });
 
         // ★ 결과 저장
         if (result33) {
@@ -592,7 +644,7 @@ async function scrape(params) {
         }
       }
 
-      await apiPage.waitForTimeout(300);
+      await msgPage.waitForTimeout(300);
     }
 
     result.debug.purchase = purchaseDebug;
