@@ -277,8 +277,10 @@ async function scrape(params) {
       try {
         apiPage = await ctx.newPage();
         await apiPage.addInitScript(stealth);
-        // brand.naver.com의 아무 페이지나 열면 됨 (API만 사용할 거라서)
-        await apiPage.goto('https://brand.naver.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        // ★ v35: brand.naver.com 단독 접속 시 sell.smartstore.naver.com으로 리다이렉트됨!
+        // → CORS 때문에 fetch 전부 실패 (TypeError: Failed to fetch)
+        // 실제 브랜드스토어 아무거나 열면 brand.naver.com 도메인에 머무름
+        await apiPage.goto('https://brand.naver.com/dcurvin', { waitUntil: 'domcontentloaded', timeout: 15000 });
         await apiPage.waitForTimeout(1000);
         console.log('[v34] smartstore: opened brand.naver.com API page');
       } catch(e) {
