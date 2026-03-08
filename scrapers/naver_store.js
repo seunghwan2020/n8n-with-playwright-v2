@@ -65,9 +65,9 @@ async function scrape(params) {
     
 
     // ===== PHASE 1: 상품 ID 수집 =====
-    // ★ v34: size=80으로 최대한 많이 가져오기 + page 2,3 수집 강화
+    // ★ v34: 네이버 HTML 80개씩 보기 지원 확인됨
     var pageSize = 80;
-    var maxPages = 3; // 80 x 3 = 최대 240개 상품 커버
+    var maxPages = 3; // 80 x 3 = 최대 240개 상품
     var waitStrategy = (storeType === 'smartstore') ? 'domcontentloaded' : 'networkidle';
 
     // ★ page 1 로드 (메인 페이지 — channelUid, channelName 추출용)
@@ -259,20 +259,23 @@ async function scrape(params) {
     }
 
     // ★ PHASE 1.5: 채널 상품 API로 전체 상품 ID 누락 보완
-    // HTML 스크래핑만으로는 상품 누락 발생 → API pagination으로 전체 ID 확보
+    // 문제: categorySearchType=DISPCATG → "전체상품" 카테고리에 등록된 상품만 반환
+    //       리드볼트 같은 스토어는 일부 색상이 서브카테고리(몬딱캐리어 등)에만 등록
+    // 해결: categorySearchType 제거 → 채널 전체 상품 조회
     if (stateInfo.channelUid) {
       var beforeCount = stateInfo.allIds.length;
       try {
-        for (var apiPg = 1; apiPg <= 5; apiPg++) {
+        for (var apiPg = 1; apiPg <= 10; apiPg++) {
           var productsResult = await apiPage.evaluate(function(args) {
             var url = args.apiBase + '/n/v2/channels/' + args.uid + '/products'
-              + '?categorySearchType=DISPCATG&sortType=POPULAR&page=' + args.page + '&pageSize=80';
+              + '?sortType=POPULAR&page=' + args.page + '&pageSize=80';
             return fetch(url, { credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
           }, { uid: stateInfo.channelUid, apiBase: apiBase, page: apiPg });
 
           if (!productsResult || !Array.isArray(productsResult.simpleProducts) || productsResult.simpleProducts.length === 0) {
+            console.log('[v34] P1.5: page ' + apiPg + ' empty, stopping');
             break;
           }
 
@@ -285,7 +288,7 @@ async function scrape(params) {
               newCount++;
             }
           }
-          console.log('[v34] PHASE 1.5: API page ' + apiPg + ' → ' + productsResult.simpleProducts.length + ' products, ' + newCount + ' new');
+          console.log('[v34] P1.5: p' + apiPg + ' → ' + productsResult.simpleProducts.length + ' products, ' + newCount + ' new');
           if (productsResult.simpleProducts.length < 80) break;
           await apiPage.waitForTimeout(300);
         }
@@ -294,7 +297,7 @@ async function scrape(params) {
       }
       result.debug.phase15_added = stateInfo.allIds.length - beforeCount;
       result.debug.totalIds = stateInfo.allIds.length;
-      console.log('[v34] PHASE 1.5: ' + beforeCount + ' → ' + stateInfo.allIds.length + ' IDs');
+      console.log('[v34] PHASE 1.5: ' + beforeCount + ' → ' + stateInfo.allIds.length + ' IDs (+' + (stateInfo.allIds.length - beforeCount) + ')');
     }
 
     // ===== PHASE 2: simple-products API =====
@@ -494,19 +497,13 @@ async function scrape(params) {
     var purchaseDebug = { total: 0, todayOk: 0, weeklyOk: 0, skipped: 0, errors: [] };
     var allPids = Object.keys(productMap);
 
-    // ★ v34: 스마트스토어는 API 경로와 호출 페이지가 다름!
-    // brand store:  brand.naver.com/n/v1/marketing-message/{id} (apiPage에서 호출)
-    // smartstore:   smartstore.naver.com/i/v1/marketing-message/{id} (원래 page에서 호출)
-    var msgApiBase, msgApiPath, msgPage;
-    if (storeType === 'smartstore') {
-      msgApiBase = 'https://smartstore.naver.com';
-      msgApiPath = '/i/v1/marketing-message/';
-      msgPage = page; // smartstore 원래 페이지에서 호출 (CORS 방지)
-    } else {
-      msgApiBase = apiBase; // brand.naver.com
-      msgApiPath = '/n/v1/marketing-message/';
-      msgPage = apiPage;
-    }
+    // ★ v34: 스마트스토어도 brand.naver.com/n/v1/ 경유!
+    // Playwright headless에서 smartstore.naver.com/i/v1/ 직접 호출은 세션 부족으로 실패.
+    // PHASE 2의 simple-products API도 동일 패턴 (v26.3에서 확인 완료).
+    // 브라우저 스크린샷에서 보이는 smartstore.naver.com/i/v1/은 로그인 세션이 있을 때만 작동.
+    var msgApiBase = apiBase; // brand.naver.com
+    var msgApiPath = '/n/v1/marketing-message/';
+    var msgPage = apiPage;
     console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품, msgBase=' + msgApiBase + msgApiPath);
 
     for (var mi = 0; mi < allPids.length; mi++) {
