@@ -259,20 +259,26 @@ async function scrape(params) {
     }
 
     // ★ PHASE 1.5: 채널 상품 API로 전체 상품 ID 누락 보완
-    // 문제: categorySearchType=DISPCATG → "전체상품" 카테고리에 등록된 상품만 반환
-    //       리드볼트 같은 스토어는 일부 색상이 서브카테고리(몬딱캐리어 등)에만 등록
-    // 해결: categorySearchType 제거 → 채널 전체 상품 조회
+    // 브랜드: brand.naver.com/n/v2/channels/{uid}/products
+    // 스마트: smartstore.naver.com/i/v2/channels/{uid}/categories/ALL/products
     if (stateInfo.channelUid) {
       var beforeCount = stateInfo.allIds.length;
+      var p15Page, p15UrlBase;
+      if (storeType === 'smartstore') {
+        p15Page = page; // same-origin
+        p15UrlBase = 'https://smartstore.naver.com/i/v2/channels/' + stateInfo.channelUid + '/categories/ALL/products';
+      } else {
+        p15Page = apiPage;
+        p15UrlBase = apiBase + '/n/v2/channels/' + stateInfo.channelUid + '/products';
+      }
       try {
         for (var apiPg = 1; apiPg <= 10; apiPg++) {
-          var productsResult = await apiPage.evaluate(function(args) {
-            var url = args.apiBase + '/n/v2/channels/' + args.uid + '/products'
-              + '?sortType=POPULAR&page=' + args.page + '&pageSize=80';
+          var productsResult = await p15Page.evaluate(function(args) {
+            var url = args.urlBase + '?sortType=POPULAR&page=' + args.page + '&pageSize=40';
             return fetch(url, { credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
-          }, { uid: stateInfo.channelUid, apiBase: apiBase, page: apiPg });
+          }, { urlBase: p15UrlBase, page: apiPg });
 
           if (!productsResult || !Array.isArray(productsResult.simpleProducts) || productsResult.simpleProducts.length === 0) {
             console.log('[v34] P1.5: page ' + apiPg + ' empty, stopping');
@@ -289,8 +295,8 @@ async function scrape(params) {
             }
           }
           console.log('[v34] P1.5: p' + apiPg + ' → ' + productsResult.simpleProducts.length + ' products, ' + newCount + ' new');
-          if (productsResult.simpleProducts.length < 80) break;
-          await apiPage.waitForTimeout(300);
+          if (productsResult.simpleProducts.length < 40) break;
+          await p15Page.waitForTimeout(300);
         }
       } catch(e) {
         console.log('[v34] PHASE 1.5 error: ' + (e.message || '').substring(0, 50));
@@ -512,6 +518,13 @@ async function scrape(params) {
     }
     console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품, msgBase=' + msgApiBase + msgApiPath);
 
+    // ★ 디버그: msgPage 현재 URL 확인
+    var msgPageUrl = '';
+    try { msgPageUrl = await msgPage.url(); } catch(e) {}
+    console.log('[v34] PHASE 3 msgPage URL: ' + msgPageUrl);
+    result.debug.msgPageUrl = msgPageUrl;
+    result.debug.msgApiBase = msgApiBase + msgApiPath;
+
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
       var msgId = productNoMap[prodId] || prodId;
@@ -530,10 +543,13 @@ async function scrape(params) {
           function doFetch(url, retry) {
             retry = retry || 0;
             return fetch(url, { credentials: 'include', cache: 'no-store' })
-              .then(function(r) { return r.ok ? r.json() : null; })
-              .catch(function() { return null; })
+              .then(function(r) {
+                if (!r.ok) return { _fail: true, _status: r.status, _url: url.substring(0, 120) };
+                return r.json();
+              })
+              .catch(function(e) { return { _fail: true, _error: String(e).substring(0, 80), _url: url.substring(0, 120) }; })
               .then(function(d) {
-                if (!d && retry < 2) {
+                if (d && d._fail && retry < 2) {
                   return new Promise(function(res) { setTimeout(res, 300); })
                     .then(function() { return doFetch(url, retry + 1); });
                 }
@@ -554,11 +570,11 @@ async function scrape(params) {
 
           // ★ 1) basisPurchased=1 → "오늘 N명" or "최근 1주간 M명"
           var url1 = buildUrl(1);
-          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=false' });
+          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=false', msgId: args.id });
 
           return doFetch(url1).then(function(d1) {
-            if (!d1 || !d1.mainPhrase) {
-              out.log.push({ step: 'call1_fail' });
+            if (!d1 || d1._fail || !d1.mainPhrase) {
+              out.log.push({ step: 'call1_fail', detail: d1 && d1._fail ? { status: d1._status, error: d1._error, url: d1._url } : 'empty_response' });
               return out;
             }
 
@@ -590,8 +606,8 @@ async function scrape(params) {
               return new Promise(function(res) { setTimeout(res, 200); }).then(function() {
                 return doFetch(url2);
               }).then(function(d2) {
-                if (!d2 || !d2.mainPhrase) {
-                  out.log.push({ step: 'call2_fail' });
+                if (!d2 || d2._fail || !d2.mainPhrase) {
+                  out.log.push({ step: 'call2_fail', detail: d2 && d2._fail ? { status: d2._status, error: d2._error } : 'empty_response' });
                   return out;
                 }
 
@@ -633,7 +649,13 @@ async function scrape(params) {
 
           if (result33.today_count !== null && result33.weekly_count === null) {
             if (purchaseDebug.errors.length < 15) {
-              purchaseDebug.errors.push({ pid: prodId, reason: 'weekly_miss', log: result33.log });
+              purchaseDebug.errors.push({ pid: prodId, msgId: msgId, reason: 'weekly_miss', log: result33.log });
+            }
+          }
+          // ★ 완전 실패 (today+weekly 둘 다 null) 진단 — 첫 5개만
+          if (result33.today_count === null && result33.weekly_count === null) {
+            if (purchaseDebug.errors.length < 5) {
+              purchaseDebug.errors.push({ pid: prodId, msgId: msgId, reason: 'all_fail', log: result33.log });
             }
           }
         } else {
