@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v30_trace',
-    debug: { build: 'V30_TRACE', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v31_cookie',
+    debug: { build: 'V31_COOKIE', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -62,11 +62,21 @@ async function scrape(params) {
     // ★ v27: 병렬 실행 시 동시 시작 방지 — 1~3초 랜덤 딜레이
     var staggerDelay = Math.floor(Math.random() * 2000) + 1000;
     await page.waitForTimeout(staggerDelay);
-    console.log('[v27] stagger delay: ' + staggerDelay + 'ms');
+    console.log('[v31] stagger delay: ' + staggerDelay + 'ms');
+
+    // ★ v31: naver.com 방문하여 세션 쿠키(NNB, NAC 등) 확보
+    // basisRepurchased가 작동하려면 네이버 세션 쿠키가 필수
+    try {
+      await page.goto('https://www.naver.com', { waitUntil: 'domcontentloaded', timeout: 10000 });
+      await page.waitForTimeout(1000);
+      console.log('[v31] naver.com 쿠키 확보 완료');
+    } catch(e) {
+      console.log('[v31] naver.com 쿠키 확보 실패 (계속 진행): ' + e.message);
+    }
 
     // ===== PHASE 1: 상품 ID 수집 =====
     var targetUrl = baseUrl + '/category/ALL?st=POPULAR&dt=LIST&page=1&size=80';
-    console.log('[v27] P1: ' + targetUrl);
+    console.log('[v31] P1: ' + targetUrl);
 
     // ★ smartstore는 networkidle 대신 domcontentloaded + 충분한 대기
     var waitStrategy = (storeType === 'smartstore') ? 'domcontentloaded' : 'networkidle';
@@ -80,7 +90,7 @@ async function scrape(params) {
           return window.__PRELOADED_STATE__ || window.__NEXT_DATA__;
         }, { timeout: 10000 });
       } catch(e) {
-        console.log('[v27] smartstore state wait timeout, continuing...');
+        console.log('[v31] smartstore state wait timeout, continuing...');
       }
       await page.waitForTimeout(2000);
     }
@@ -158,7 +168,7 @@ async function scrape(params) {
 
     // ★ smartstore fallback: __PRELOADED_STATE__ 실패 시 DOM에서 직접 추출
     if (stateInfo.allIds.length === 0 && storeType === 'smartstore') {
-      console.log('[v27] smartstore fallback: DOM scraping');
+      console.log('[v31] smartstore fallback: DOM scraping');
       var domInfo = await page.evaluate(function(baseUrl) {
         var out = { channelUid: '', channelName: '', allIds: [], method: 'dom_fallback' };
         try {
@@ -199,7 +209,7 @@ async function scrape(params) {
       if (domInfo.allIds.length > 0) {
         stateInfo = domInfo;
         if (domInfo.channelName) result.brand_name = domInfo.channelName;
-        console.log('[v27] DOM fallback found ' + domInfo.allIds.length + ' products');
+        console.log('[v31] DOM fallback found ' + domInfo.allIds.length + ' products');
       }
     }
 
@@ -225,9 +235,9 @@ async function scrape(params) {
         // brand.naver.com의 아무 페이지나 열면 됨 (API만 사용할 거라서)
         await apiPage.goto('https://brand.naver.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
         await apiPage.waitForTimeout(1000);
-        console.log('[v27] smartstore: opened brand.naver.com API page');
+        console.log('[v31] smartstore: opened brand.naver.com API page');
       } catch(e) {
-        console.log('[v27] smartstore: brand page open failed, using original page');
+        console.log('[v31] smartstore: brand page open failed, using original page');
         apiPage = page; // 실패하면 원래 페이지 사용
       }
     }
@@ -239,7 +249,7 @@ async function scrape(params) {
 
     // ★ smartstore는 먼저 __PRELOADED_STATE__에서 직접 상품 데이터 추출 시도
     if (storeType === 'smartstore') {
-      console.log('[v27] smartstore: extracting products from __PRELOADED_STATE__');
+      console.log('[v31] smartstore: extracting products from __PRELOADED_STATE__');
       var stateProducts = await page.evaluate(function(baseUrl) {
         var out = { products: [], productNoMap: {} };
         try {
@@ -308,7 +318,7 @@ async function scrape(params) {
         return out;
       }, baseUrl);
 
-      console.log('[v27] smartstore state products: ' + stateProducts.products.length);
+      console.log('[v31] smartstore state products: ' + stateProducts.products.length);
 
       if (stateProducts.products.length > 0) {
         for (var spi = 0; spi < stateProducts.products.length; spi++) {
@@ -339,7 +349,7 @@ async function scrape(params) {
       for (var mi2 = 0; mi2 < stateInfo.allIds.length; mi2++) {
         if (!productMap[stateInfo.allIds[mi2]]) missingIds.push(stateInfo.allIds[mi2]);
       }
-      console.log('[v27] missing IDs from state: ' + missingIds.length);
+      console.log('[v31] missing IDs from state: ' + missingIds.length);
     }
     var idsToFetch = (Object.keys(productMap).length === 0) ? stateInfo.allIds : missingIds;
 
@@ -364,7 +374,7 @@ async function scrape(params) {
             }, { uid: stateInfo.channelUid, ids: batch, apiBase: apiBase, path: currentPath });
 
             if (apiResult && apiResult._failed) {
-              console.log('[v27] API path ' + currentPath + ' failed: ' + (apiResult._status || apiResult._error));
+              console.log('[v31] API path ' + currentPath + ' failed: ' + (apiResult._status || apiResult._error));
               break; // 이 경로는 실패, 다음 경로 시도
             }
 
@@ -401,7 +411,7 @@ async function scrape(params) {
         }
 
         if (pathWorked) {
-          console.log('[v27] API path worked: ' + currentPath + ', products: ' + Object.keys(productMap).length);
+          console.log('[v31] API path worked: ' + currentPath + ', products: ' + Object.keys(productMap).length);
           result.debug.apiPathUsed = currentPath;
           break;
         }
@@ -420,7 +430,7 @@ async function scrape(params) {
 
     var purchaseDebug = { total: 0, todayOk: 0, weeklyOk: 0, skipped: 0, errors: [] };
     var allPids = Object.keys(productMap);
-    console.log('[v30] PHASE 3 시작: ' + allPids.length + '개 상품');
+    console.log('[v31] PHASE 3 시작: ' + allPids.length + '개 상품');
 
     for (var mi = 0; mi < allPids.length; mi++) {
       var prodId = allPids[mi];
@@ -611,7 +621,7 @@ async function scrape(params) {
     }
 
     result.debug.purchase = purchaseDebug;
-    console.log('[v30] PHASE 3 완료: today=' + purchaseDebug.todayOk + ' weekly=' + purchaseDebug.weeklyOk + ' skip=' + purchaseDebug.skipped + ' err=' + purchaseDebug.errors.length);
+    console.log('[v31] PHASE 3 완료: today=' + purchaseDebug.todayOk + ' weekly=' + purchaseDebug.weeklyOk + ' skip=' + purchaseDebug.skipped + ' err=' + purchaseDebug.errors.length);
 
     // ===== PHASE 4: 결과 =====
     var pids = Object.keys(productMap);
@@ -670,7 +680,7 @@ async function spy(params) {
 }
 
 async function execute(action, req, res) {
-  console.log('[naver_store v30] action=' + action);
+  console.log('[naver_store v31] action=' + action);
   try {
     if (action === 'scrape') return res.json(await scrape(req.body));
     if (action === 'spy') return res.json(await spy(req.body));
