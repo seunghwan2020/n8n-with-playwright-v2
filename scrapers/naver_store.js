@@ -497,13 +497,19 @@ async function scrape(params) {
     var purchaseDebug = { total: 0, todayOk: 0, weeklyOk: 0, skipped: 0, errors: [] };
     var allPids = Object.keys(productMap);
 
-    // ★ v34: 스마트스토어도 brand.naver.com/n/v1/ 경유!
-    // Playwright headless에서 smartstore.naver.com/i/v1/ 직접 호출은 세션 부족으로 실패.
-    // PHASE 2의 simple-products API도 동일 패턴 (v26.3에서 확인 완료).
-    // 브라우저 스크린샷에서 보이는 smartstore.naver.com/i/v1/은 로그인 세션이 있을 때만 작동.
-    var msgApiBase = apiBase; // brand.naver.com
-    var msgApiPath = '/n/v1/marketing-message/';
-    var msgPage = apiPage;
+    // ★ v34: 스마트스토어는 smartstore.naver.com/i/v1/ 경유!
+    // brand.naver.com/n/v1/은 브랜드스토어 상품만 인식 — 스마트스토어 상품은 call1_fail
+    // 스마트스토어 page에서 same-origin 호출하면 CORS 문제 없음
+    var msgApiBase, msgApiPath, msgPage;
+    if (storeType === 'smartstore') {
+      msgApiBase = 'https://smartstore.naver.com';
+      msgApiPath = '/i/v1/marketing-message/';
+      msgPage = page; // 원래 스마트스토어 페이지 (same-origin)
+    } else {
+      msgApiBase = apiBase; // brand.naver.com
+      msgApiPath = '/n/v1/marketing-message/';
+      msgPage = apiPage;
+    }
     console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품, msgBase=' + msgApiBase + msgApiPath);
 
     for (var mi = 0; mi < allPids.length; mi++) {
