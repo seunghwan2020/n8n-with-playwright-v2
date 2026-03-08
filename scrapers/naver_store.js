@@ -534,11 +534,18 @@ async function scrape(params) {
       try {
         var result33 = await msgPage.evaluate(function(args) {
           function buildUrl(basisPurchased) {
-            return args.msgApiBase + args.path + args.id
+            var url = args.msgApiBase + args.path + args.id
               + '?currentPurchaseType=Paid'
               + '&usePurchased=true&basisPurchased=' + basisPurchased
-              + '&usePurchasedIn2Y=true'
-              + '&useRepurchased=false';
+              + '&usePurchasedIn2Y=true';
+            // ★ 스마트스토어: useRepurchased=true 필수 (false면 API 실패)
+            // ★ 브랜드스토어: useRepurchased=false (분리 호출로 정확한 주간 데이터)
+            if (args.isSmartstore) {
+              url += '&useRepurchased=true&basisRepurchased=' + basisPurchased;
+            } else {
+              url += '&useRepurchased=false';
+            }
+            return url;
           }
 
           function doFetch(url, retry) {
@@ -571,7 +578,7 @@ async function scrape(params) {
 
           // ★ 1) basisPurchased=1 → "오늘 N명" or "최근 1주간 M명"
           var url1 = buildUrl(1);
-          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=false', msgId: args.id });
+          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=' + (args.isSmartstore ? 'true' : 'false'), msgId: args.id });
 
           return doFetch(url1).then(function(d1) {
             if (!d1 || d1._fail || !d1.mainPhrase) {
@@ -602,7 +609,7 @@ async function scrape(params) {
               // ★ 2) basisPurchased=(todayCount+1) → "최근 1주간 M명"
               var nextBasis = cnt1 + 1;
               var url2 = buildUrl(nextBasis);
-              out.log.push({ step: 'call2', params: 'basisPurchased=' + nextBasis + '&useRepurchased=false' });
+              out.log.push({ step: 'call2', params: 'basisPurchased=' + nextBasis + '&useRepurchased=' + (args.isSmartstore ? 'true' : 'false') });
 
               return new Promise(function(res) { setTimeout(res, 200); }).then(function() {
                 return doFetch(url2);
@@ -630,7 +637,7 @@ async function scrape(params) {
             return out;
           });
 
-        }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath });
+        }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath, isSmartstore: (storeType === 'smartstore') });
 
         // ★ 결과 저장
         if (result33) {
