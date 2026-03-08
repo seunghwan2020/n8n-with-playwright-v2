@@ -62,7 +62,6 @@ async function scrape(params) {
     // ★ v27: 병렬 실행 시 동시 시작 방지 — 1~3초 랜덤 딜레이
     var staggerDelay = Math.floor(Math.random() * 2000) + 1000;
     await page.waitForTimeout(staggerDelay);
-    
 
     // ===== PHASE 1: 상품 ID 수집 =====
     // ★ v34: 네이버 HTML 80개씩 보기 지원 확인됨
@@ -233,6 +232,36 @@ async function scrape(params) {
     for (var p2i = 0; p2i < extraPageIds.length; p2i++) {
       if (stateInfo.allIds.indexOf(extraPageIds[p2i]) === -1) {
         stateInfo.allIds.push(extraPageIds[p2i]);
+      }
+    }
+
+    // ★ v35: __PRELOADED_STATE__에서 channelUid 못 찾으면 smart-stores API fallback
+    // smartstore.naver.com 페이지에서 same-origin 호출 (추가 네비게이션 없음)
+    if (!stateInfo.channelUid && storeType === 'smartstore') {
+      try {
+        console.log('[v35] channelUid not found in state, trying smart-stores API...');
+        var resolveResult = await page.evaluate(function(slug) {
+          var url = 'https://smartstore.naver.com/i/v1/smart-stores?url=' + encodeURIComponent(slug);
+          return fetch(url, { credentials: 'include' })
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .catch(function() { return null; });
+        }, storeSlug);
+
+        if (resolveResult) {
+          stateInfo.channelUid = resolveResult.channelUid
+            || (resolveResult.smartStore && resolveResult.smartStore.channelUid)
+            || (resolveResult.channel && resolveResult.channel.channelUid)
+            || '';
+          if (!stateInfo.channelName) {
+            stateInfo.channelName = resolveResult.channelName
+              || (resolveResult.smartStore && resolveResult.smartStore.channelName)
+              || (resolveResult.channel && resolveResult.channel.channelName)
+              || '';
+          }
+          console.log('[v35] smart-stores API → uid=' + stateInfo.channelUid + ', name=' + stateInfo.channelName);
+        }
+      } catch(e) {
+        console.log('[v35] smart-stores API error: ' + (e.message || '').substring(0, 50));
       }
     }
 
@@ -504,19 +533,13 @@ async function scrape(params) {
     var purchaseDebug = { total: 0, todayOk: 0, weeklyOk: 0, skipped: 0, errors: [] };
     var allPids = Object.keys(productMap);
 
-    // ★ v34: 스마트스토어는 smartstore.naver.com/i/v1/ 경유!
-    // brand.naver.com/n/v1/은 브랜드스토어 상품만 인식 — 스마트스토어 상품은 call1_fail
-    // 스마트스토어 page에서 same-origin 호출하면 CORS 문제 없음
-    var msgApiBase, msgApiPath, msgPage;
-    if (storeType === 'smartstore') {
-      msgApiBase = 'https://smartstore.naver.com';
-      msgApiPath = '/i/v1/marketing-message/';
-      msgPage = page; // 원래 스마트스토어 페이지 (same-origin)
-    } else {
-      msgApiBase = apiBase; // brand.naver.com
-      msgApiPath = '/n/v1/marketing-message/';
-      msgPage = apiPage;
-    }
+    // ★ v35: 모든 스토어를 brand.naver.com 경유로 통일!
+    // smartstore.naver.com/i/v1/은 비로그인 headless에서 429 차단
+    // brand.naver.com/n/v1/은 productNo 기반이라 스마트스토어 상품도 인식
+    // (simple-products API도 이미 brand.naver.com에서 스마트스토어 상품 정상 조회 중)
+    var msgApiBase = apiBase; // brand.naver.com
+    var msgApiPath = '/n/v1/marketing-message/';
+    var msgPage = apiPage;
     console.log('[v34] PHASE 3 시작: ' + allPids.length + '개 상품, msgBase=' + msgApiBase + msgApiPath);
 
     // ★ 디버그: msgPage 현재 URL 확인
@@ -543,18 +566,12 @@ async function scrape(params) {
       try {
         var result33 = await msgPage.evaluate(function(args) {
           function buildUrl(basisPurchased) {
-            var url = args.msgApiBase + args.path + args.id
+            // ★ v35: 모든 스토어 brand.naver.com 경유 → useRepurchased=false 통일
+            return args.msgApiBase + args.path + args.id
               + '?currentPurchaseType=Paid'
               + '&usePurchased=true&basisPurchased=' + basisPurchased
-              + '&usePurchasedIn2Y=true';
-            // ★ 스마트스토어: useRepurchased=true 필수 (false면 API 실패)
-            // ★ 브랜드스토어: useRepurchased=false (분리 호출로 정확한 주간 데이터)
-            if (args.isSmartstore) {
-              url += '&useRepurchased=true&basisRepurchased=' + basisPurchased;
-            } else {
-              url += '&useRepurchased=false';
-            }
-            return url;
+              + '&usePurchasedIn2Y=true'
+              + '&useRepurchased=false';
           }
 
           function doFetch(url, retry) {
@@ -594,7 +611,7 @@ async function scrape(params) {
 
           // ★ 1) basisPurchased=1 → "오늘 N명" or "최근 1주간 M명"
           var url1 = buildUrl(1);
-          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=' + (args.isSmartstore ? 'true' : 'false'), msgId: args.id });
+          out.log.push({ step: 'call1', params: 'basisPurchased=1&useRepurchased=false', msgId: args.id });
 
           return doFetch(url1).then(function(d1) {
             if (!d1 || d1._fail || !d1.mainPhrase) {
@@ -625,7 +642,7 @@ async function scrape(params) {
               // ★ 2) basisPurchased=(todayCount+1) → "최근 1주간 M명"
               var nextBasis = cnt1 + 1;
               var url2 = buildUrl(nextBasis);
-              out.log.push({ step: 'call2', params: 'basisPurchased=' + nextBasis + '&useRepurchased=' + (args.isSmartstore ? 'true' : 'false') });
+              out.log.push({ step: 'call2', params: 'basisPurchased=' + nextBasis + '&useRepurchased=false' });
 
               return new Promise(function(res) { setTimeout(res, 200); }).then(function() {
                 return doFetch(url2);
@@ -653,7 +670,7 @@ async function scrape(params) {
             return out;
           });
 
-        }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath, isSmartstore: (storeType === 'smartstore') });
+        }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath });
 
         // ★ 결과 저장 + 429 카운터 관리
         if (result33) {
@@ -706,8 +723,7 @@ async function scrape(params) {
         }
       }
 
-      // ★ 스마트스토어: 429 방지를 위해 더 긴 딜레이
-      await msgPage.waitForTimeout(storeType === 'smartstore' ? 800 : 300);
+      await msgPage.waitForTimeout(300);
     }
 
     result.debug.purchase = purchaseDebug;
