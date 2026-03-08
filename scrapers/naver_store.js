@@ -526,7 +526,16 @@ async function scrape(params) {
     result.debug.msgPageUrl = msgPageUrl;
     result.debug.msgApiBase = msgApiBase + msgApiPath;
 
+    var consecutive429 = 0; // ★ 연속 429 카운터 — 5회 연속이면 나머지 스킵 (타임아웃 방지)
+
     for (var mi = 0; mi < allPids.length; mi++) {
+      // ★ 연속 429가 5회 이상이면 rate limit 상태 → 나머지 스킵
+      if (consecutive429 >= 5) {
+        purchaseDebug.skipped += (allPids.length - mi);
+        console.log('[v34] 429 rate limit: skipping remaining ' + (allPids.length - mi) + ' products');
+        break;
+      }
+
       var prodId = allPids[mi];
       var msgId = productNoMap[prodId] || prodId;
       purchaseDebug.total++;
@@ -558,14 +567,13 @@ async function scrape(params) {
               })
               .catch(function(e) { return { _fail: true, _error: String(e).substring(0, 80), _url: url.substring(0, 120) }; })
               .then(function(d) {
-                // ★ 429 rate limit: 더 긴 대기 + 최대 4회 재시도
-                if (d && d._rateLimited && retry < 4) {
-                  var backoff = (retry + 1) * 1500; // 1.5s, 3s, 4.5s, 6s
-                  return new Promise(function(res) { setTimeout(res, backoff); })
+                // ★ 429: 1회만 재시도, 2초 대기
+                if (d && d._rateLimited && retry < 1) {
+                  return new Promise(function(res) { setTimeout(res, 2000); })
                     .then(function() { return doFetch(url, retry + 1); });
                 }
-                // 일반 실패: 2회 재시도
-                if (d && d._fail && !d._rateLimited && retry < 2) {
+                // 일반 실패: 1회 재시도
+                if (d && d._fail && !d._rateLimited && retry < 1) {
                   return new Promise(function(res) { setTimeout(res, 300); })
                     .then(function() { return doFetch(url, retry + 1); });
                 }
@@ -647,8 +655,21 @@ async function scrape(params) {
 
         }, { id: msgId, msgApiBase: msgApiBase, path: msgApiPath, isSmartstore: (storeType === 'smartstore') });
 
-        // ★ 결과 저장
+        // ★ 결과 저장 + 429 카운터 관리
         if (result33) {
+          // 429 체크: log에서 rateLimited 확인
+          var got429 = false;
+          if (result33.log) {
+            for (var li = 0; li < result33.log.length; li++) {
+              if (result33.log[li].detail && result33.log[li].detail.status === 429) { got429 = true; break; }
+            }
+          }
+          if (got429) {
+            consecutive429++;
+          } else {
+            consecutive429 = 0; // 성공하면 리셋
+          }
+
           if (result33.today_count !== null) {
             productMap[prodId].purchase_count_today = result33.today_count;
             productMap[prodId].purchase_text_today = result33.today_phrase;
