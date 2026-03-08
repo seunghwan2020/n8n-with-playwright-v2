@@ -552,12 +552,20 @@ async function scrape(params) {
             retry = retry || 0;
             return fetch(url, { credentials: 'include', cache: 'no-store' })
               .then(function(r) {
+                if (r.status === 429) return { _fail: true, _status: 429, _rateLimited: true, _url: url.substring(0, 120) };
                 if (!r.ok) return { _fail: true, _status: r.status, _url: url.substring(0, 120) };
                 return r.json();
               })
               .catch(function(e) { return { _fail: true, _error: String(e).substring(0, 80), _url: url.substring(0, 120) }; })
               .then(function(d) {
-                if (d && d._fail && retry < 2) {
+                // ★ 429 rate limit: 더 긴 대기 + 최대 4회 재시도
+                if (d && d._rateLimited && retry < 4) {
+                  var backoff = (retry + 1) * 1500; // 1.5s, 3s, 4.5s, 6s
+                  return new Promise(function(res) { setTimeout(res, backoff); })
+                    .then(function() { return doFetch(url, retry + 1); });
+                }
+                // 일반 실패: 2회 재시도
+                if (d && d._fail && !d._rateLimited && retry < 2) {
                   return new Promise(function(res) { setTimeout(res, 300); })
                     .then(function() { return doFetch(url, retry + 1); });
                 }
@@ -677,7 +685,8 @@ async function scrape(params) {
         }
       }
 
-      await msgPage.waitForTimeout(300);
+      // ★ 스마트스토어: 429 방지를 위해 더 긴 딜레이
+      await msgPage.waitForTimeout(storeType === 'smartstore' ? 800 : 300);
     }
 
     result.debug.purchase = purchaseDebug;
