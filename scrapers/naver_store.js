@@ -259,22 +259,23 @@ async function scrape(params) {
     }
 
     // ★ PHASE 1.5: 채널 상품 API로 전체 상품 ID 누락 보완
-    // 브랜드: brand.naver.com/n/v2/channels/{uid}/products
-    // 스마트: smartstore.naver.com/i/v2/channels/{uid}/categories/ALL/products
+    // 실제 브라우저 요청 패턴:
+    // 브랜드: brand.naver.com/n/v2/channels/{uid}/categories/ALL/products?categorySearchType=DISPCATG&sortType=POPULAR&page=1&pageSize=40
+    // 스마트: smartstore.naver.com/i/v2/channels/{uid}/categories/ALL/products?categorySearchType=DISPCATG&sortType=POPULAR&page=1&pageSize=40
     if (stateInfo.channelUid) {
       var beforeCount = stateInfo.allIds.length;
       var p15Page, p15UrlBase;
       if (storeType === 'smartstore') {
-        p15Page = page; // same-origin
+        p15Page = page;
         p15UrlBase = 'https://smartstore.naver.com/i/v2/channels/' + stateInfo.channelUid + '/categories/ALL/products';
       } else {
         p15Page = apiPage;
-        p15UrlBase = apiBase + '/n/v2/channels/' + stateInfo.channelUid + '/products';
+        p15UrlBase = apiBase + '/n/v2/channels/' + stateInfo.channelUid + '/categories/ALL/products';
       }
       try {
         for (var apiPg = 1; apiPg <= 10; apiPg++) {
           var productsResult = await p15Page.evaluate(function(args) {
-            var url = args.urlBase + '?sortType=POPULAR&page=' + args.page + '&pageSize=40';
+            var url = args.urlBase + '?categorySearchType=DISPCATG&sortType=POPULAR&page=' + args.page + '&pageSize=40';
             return fetch(url, { credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
