@@ -35,8 +35,8 @@ async function scrape(params) {
   var storeType = params.store_type || 'brand';
   var result = {
     status: 'OK', data: [], channel_uid: '', error: null,
-    method_used: 'v28.1_debug',
-    debug: { build: 'V28.1_DEBUG', storeSlug: storeSlug, storeType: storeType }
+    method_used: 'v28.2_trace',
+    debug: { build: 'V28.2_TRACE', storeSlug: storeSlug, storeType: storeType }
   };
 
   var br = null; var ctx = null; var page = null;
@@ -489,6 +489,11 @@ async function scrape(params) {
         var phrase1 = r1.data.mainPhrase;
         var count1 = extractCount(phrase1);
 
+        // ★ 디버그: Step 1 결과 기록
+        productMap[prodId]._step1_basis = 1;
+        productMap[prodId]._step1_prefix = prefix1;
+        productMap[prodId]._step1_count = count1;
+
         if (count1 === 0) {
           purchaseDebug.skipped++;
           await apiPage.waitForTimeout(300);
@@ -504,6 +509,7 @@ async function scrape(params) {
           productMap[prodId].purchase_count_weekly = count1;
           productMap[prodId].purchase_text_weekly = phrase1;
           productMap[prodId].purchase_prefix_weekly = prefix1;
+          productMap[prodId]._step2_basis = 'not_needed';
           purchaseDebug.weeklyOk++;
 
         } else if (prefix1.indexOf('\uC624\uB298') > -1) {
@@ -518,6 +524,10 @@ async function scrape(params) {
           // ex) 오늘 4명이면 basisRepurchased=5
           // ==================================================
           var nextBasis = count1 + 1;
+
+          // ★ 디버그: Step 2 호출 기록
+          productMap[prodId]._step2_basis = nextBasis;
+
           var url2 = apiBase + '/n/v1/marketing-message/' + msgId
             + '?currentPurchaseType=Paid&usePurchased=true&basisPurchased=1'
             + '&usePurchasedIn2Y=true&useRepurchased=true&basisRepurchased=' + nextBasis;
@@ -538,6 +548,10 @@ async function scrape(params) {
             var phrase2 = r2.data.mainPhrase;
             var count2 = extractCount(phrase2);
 
+            // ★ 디버그: Step 2 결과 기록
+            productMap[prodId]._step2_prefix = prefix2;
+            productMap[prodId]._step2_count = count2;
+
             if (count2 > 0 && prefix2.indexOf('\uCD5C\uADFC') > -1) {
               // ★ "최근 1주간" 확인 → weekly 저장
               productMap[prodId].purchase_count_weekly = count2;
@@ -546,12 +560,15 @@ async function scrape(params) {
               purchaseDebug.weeklyOk++;
             } else {
               // "최근"이 아님 → weekly는 null 유지
+              productMap[prodId]._step2_err = 'not_weekly:' + prefix2;
               if (purchaseDebug.errors.length < 15) {
                 purchaseDebug.errors.push({ pid: prodId, step: 2, reason: 'not_weekly', prefix: prefix2, basis: nextBasis });
               }
             }
           } else {
             // Step 2 실패 → weekly는 null 유지 (COALESCE로 기존값 보호)
+            productMap[prodId]._step2_prefix = 'FETCH_FAIL';
+            productMap[prodId]._step2_err = r2 ? r2.err : 'null';
             if (purchaseDebug.errors.length < 15) {
               purchaseDebug.errors.push({ pid: prodId, step: 2, reason: 'fetch_fail', err: r2 ? r2.err : 'null', basis: nextBasis });
             }
@@ -587,7 +604,16 @@ async function scrape(params) {
         purchase_text_weekly: prod.purchase_text_weekly,
         purchase_prefix_weekly: prod.purchase_prefix_weekly,
         product_image_url: prod.product_image_url, category_name: prod.category_name,
-        is_sold_out: prod.is_sold_out, product_url: prod.product_url
+        is_sold_out: prod.is_sold_out, product_url: prod.product_url,
+        _debug: {
+          step1_basis: prod._step1_basis !== undefined ? prod._step1_basis : null,
+          step1_prefix: prod._step1_prefix !== undefined ? prod._step1_prefix : null,
+          step1_count: prod._step1_count !== undefined ? prod._step1_count : null,
+          step2_basis: prod._step2_basis !== undefined ? prod._step2_basis : null,
+          step2_prefix: prod._step2_prefix !== undefined ? prod._step2_prefix : null,
+          step2_count: prod._step2_count !== undefined ? prod._step2_count : null,
+          step2_err: prod._step2_err !== undefined ? prod._step2_err : null
+        }
       });
     }
 
