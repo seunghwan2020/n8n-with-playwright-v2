@@ -19,7 +19,7 @@ function getProxyConfig() {
         console.log(`📍 [PROXY] 한국 Residential Proxy 사용: ${PROXY_HOST}:${PROXY_PORT}`);
         return {
             server: `http://${PROXY_HOST}:${PROXY_PORT}`,
-            username: `${PROXY_USER}-country-kr`,
+            username: PROXY_USER,
             password: PROXY_PASS
         };
     }
@@ -56,7 +56,7 @@ async function execute(action, req, res) {
             globalPage = await context.newPage();
 
             console.log('📍 [EZADMIN LOGIN] STEP 2: 메인 페이지 접속...');
-            await globalPage.goto('https://ezadmin.co.kr/index.html');
+            await globalPage.goto('https://ezadmin.co.kr/index.html', { timeout: 60000 });
             
             await globalPage.waitForTimeout(2000);
             
@@ -103,7 +103,7 @@ async function execute(action, req, res) {
                 console.log('📍 [EZADMIN LOGIN] STEP 6: ga67 재고 페이지 접속하여 세션 검증...');
                 await globalPage.goto('https://ga67.ezadmin.co.kr/template35.htm?template=I100', { 
                     waitUntil: 'domcontentloaded',
-                    timeout: 30000 
+                    timeout: 60000 
                 });
                 await globalPage.waitForTimeout(3000);
                 
@@ -167,7 +167,7 @@ async function execute(action, req, res) {
 
             console.log('\n📍 [EZADMIN SCRAPE] STEP 1: 재고 현황 페이지 이동...');
             const targetUrl = `https://ga67.ezadmin.co.kr/template35.htm?template=I100`;
-            await globalPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await globalPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
             await globalPage.waitForTimeout(3000);
 
             const currentUrl = globalPage.url();
