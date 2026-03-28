@@ -104,44 +104,75 @@ async function execute(action, req, res) {
             await globalPage.fill('#login-id', EZ_USER);
             await globalPage.fill('#login-pwd', EZ_PW);
 
-            // ★ STEP 5: 로그인 버튼 클릭
+            // ★ STEP 5: 로그인 버튼 클릭 (evaluate로 직접 JS 호출)
             console.log('📍 [EZADMIN LOGIN] STEP 5: 로그인 버튼 클릭...');
-            await globalPage.click('.login-btn');
-            await globalPage.waitForTimeout(3000);
+            await globalPage.evaluate(() => {
+                const btn = document.querySelector('.login-btn');
+                if (btn) btn.click();
+            });
+            console.log('📍 [EZADMIN LOGIN] STEP 5.5: 로그인 처리 대기 (5초)...');
+            await globalPage.waitForTimeout(5000);
 
-            // ★ STEP 6: 보안코드 체크
-            console.log('📍 [EZADMIN LOGIN] STEP 6: 보안코드 확인 중...');
-            try {
-                const captchaInput = await globalPage.waitForSelector('input[id^="inputAuthCode"]', { timeout: 4000 });
-                if (captchaInput) {
-                    console.log('📍 [EZADMIN LOGIN] ✨ 보안코드 감지됨!');
-                    const captchaWrap = await globalPage.$('div[id^="auth_img_wrap"]');
-                    const captchaBuffer = await captchaWrap.screenshot();
-                    isProcessing = false;
-                    return res.json({
-                        status: 'AUTH_REQUIRED',
-                        message: '보안코드가 필요합니다.',
-                        screenshot: 'data:image/png;base64,' + captchaBuffer.toString('base64')
-                    });
-                }
-            } catch (e) {
-                // 보안코드 없음 = 로그인 성공
-                const currentUrl = globalPage.url();
-                console.log(`📍 [EZADMIN LOGIN] ✅ 로그인 성공! 현재 URL: ${currentUrl}`);
-                
-                // ★ 로그인 후 스크린샷 캡처 (실제 로그인 확인용)
-                let loginScreenshot = null;
-                try {
-                    const buffer = await globalPage.screenshot();
-                    loginScreenshot = 'data:image/png;base64,' + buffer.toString('base64');
-                    console.log('📍 [EZADMIN LOGIN] 📸 로그인 후 스크린샷 캡처 완료');
-                } catch (ssErr) {
-                    console.log(`📍 [EZADMIN LOGIN] 스크린샷 실패: ${ssErr.message}`);
-                }
-                
+            // ★ STEP 6: 로그인 결과 확인
+            const afterLoginUrl = globalPage.url();
+            console.log(`📍 [EZADMIN LOGIN] STEP 6: 현재 URL: ${afterLoginUrl}`);
+
+            // 6-1: 보안코드 확인
+            const hasCaptcha = await globalPage.isVisible('input[id^="inputAuthCode"]');
+            if (hasCaptcha) {
+                console.log('📍 [EZADMIN LOGIN] ✨ 보안코드 감지됨!');
+                const captchaWrap = await globalPage.$('div[id^="auth_img_wrap"]');
+                let captchaScreenshot = null;
+                try { captchaScreenshot = 'data:image/png;base64,' + (await captchaWrap.screenshot()).toString('base64'); } catch(e) {}
                 isProcessing = false;
-                return res.json({ status: 'SUCCESS', message: '로그인 완료', currentUrl: currentUrl, screenshot: loginScreenshot });
+                return res.json({
+                    status: 'AUTH_REQUIRED',
+                    message: '보안코드가 필요합니다.',
+                    screenshot: captchaScreenshot
+                });
             }
+
+            // 6-2: 로그인 팝업이 아직 열려있는지 확인 (= 로그인 실패)
+            const stillLoginPopup = await globalPage.isVisible('#login-domain');
+            if (stillLoginPopup) {
+                console.log('📍 [EZADMIN LOGIN] ❌ 로그인 팝업이 아직 열려있음 — 로그인 실패!');
+                // 에러 메시지 추출 시도
+                let errMsg = '';
+                try { errMsg = await globalPage.textContent('.login-error, .error-msg, #login-popup .error') || ''; } catch(e) {}
+                let screenshot = null;
+                try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+                isProcessing = false;
+                return res.status(401).json({
+                    status: 'ERROR',
+                    message: '로그인 실패 — 팝업이 닫히지 않음. ' + errMsg,
+                    currentUrl: afterLoginUrl,
+                    screenshot: screenshot
+                });
+            }
+
+            // 6-3: 페이지 내용으로 로그인 여부 확인
+            const pageText = await globalPage.textContent('body') || '';
+            const isLoggedIn = pageText.includes('로그아웃') || pageText.includes('seedgrow') || pageText.includes('디커빈');
+            
+            let loginScreenshot = null;
+            try { loginScreenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+
+            if (isLoggedIn) {
+                console.log('📍 [EZADMIN LOGIN] ✅ 로그인 성공 확인! (로그아웃 버튼 또는 계정명 발견)');
+                isProcessing = false;
+                return res.json({ status: 'SUCCESS', message: '로그인 완료', currentUrl: afterLoginUrl, screenshot: loginScreenshot });
+            }
+
+            // 6-4: 로그인 팝업도 없고, 로그아웃 버튼도 없음 — 애매한 상태
+            console.log(`📍 [EZADMIN LOGIN] ⚠️ 로그인 상태 불명확. URL: ${afterLoginUrl}`);
+            console.log(`📍 [EZADMIN LOGIN] 페이지 텍스트 앞 300자: ${pageText.substring(0, 300)}`);
+            isProcessing = false;
+            return res.json({ 
+                status: 'UNKNOWN', 
+                message: '로그인 상태 불명확 — 스크린샷 확인 필요', 
+                currentUrl: afterLoginUrl, 
+                screenshot: loginScreenshot 
+            });
         }
 
         // ========================================
