@@ -5,28 +5,9 @@ const EZ_DOMAIN = process.env['EZ_DOMAIN'];
 const EZ_USER = process.env['EZ_USER'];
 const EZ_PW = process.env['EZ_PW'];
 
-// ★ DataImpulse 한국 Residential Proxy
-const PROXY_HOST = process.env['PROXY_HOST'];
-const PROXY_PORT = process.env['PROXY_PORT'];
-const PROXY_USER = process.env['PROXY_USER'];
-const PROXY_PASS = process.env['PROXY_PASS'];
-
 let globalBrowser = null;
 let globalPage = null;
 let isProcessing = false; // ★ 동시 요청 방지 락
-
-function getProxyConfig() {
-    if (PROXY_HOST && PROXY_PORT && PROXY_USER && PROXY_PASS) {
-        console.log(`📍 [PROXY] 한국 Residential Proxy 사용: ${PROXY_HOST}:${PROXY_PORT}`);
-        return {
-            server: `http://${PROXY_HOST}:${PROXY_PORT}`,
-            username: `${PROXY_USER}__cr.kr`,
-            password: PROXY_PASS
-        };
-    }
-    console.log('📍 [PROXY] 프록시 설정 없음 — 직접 연결');
-    return undefined;
-}
 
 async function execute(action, req, res) {
     // ★ 동시 요청 방지 — 이전 요청이 처리 중이면 대기
@@ -52,31 +33,12 @@ async function execute(action, req, res) {
                 globalPage = null;
             }
 
-            // ★ 한국 프록시로 Chromium 실행
-            const proxyConfig = getProxyConfig();
-            const launchOptions = { 
+            globalBrowser = await chromium.launch({ 
                 args: ['--no-sandbox', '--disable-setuid-sandbox'] 
-            };
-            if (proxyConfig) {
-                launchOptions.proxy = proxyConfig;
-            }
-            globalBrowser = await chromium.launch(launchOptions);
+            });
             
-            let contextOptions = { viewport: { width: 1400, height: 900 } };
-            
-            // ★ 세션 파일은 사용하지 않음 (프록시 IP가 바뀌면 세션 무효)
-            const context = await globalBrowser.newContext(contextOptions);
+            const context = await globalBrowser.newContext({ viewport: { width: 1400, height: 900 } });
             globalPage = await context.newPage();
-
-            // ★ STEP 1.5: 프록시 출구 IP 확인
-            console.log('📍 [EZADMIN LOGIN] STEP 1.5: 프록시 출구 IP 확인...');
-            try {
-                await globalPage.goto('https://api.ipify.org?format=json', { timeout: 15000 });
-                const ipText = await globalPage.textContent('body');
-                console.log(`📍 [PROXY] 출구 IP: ${ipText}`);
-            } catch (ipErr) {
-                console.log(`📍 [PROXY] IP 확인 실패 (무시): ${ipErr.message}`);
-            }
 
             // ★ STEP 2: 메인 페이지 접속
             console.log('📍 [EZADMIN LOGIN] STEP 2: 메인 페이지 접속...');
@@ -152,18 +114,24 @@ async function execute(action, req, res) {
 
             // 6-3: 페이지 내용으로 로그인 여부 확인
             const pageText = await globalPage.textContent('body') || '';
-            const isLoggedIn = pageText.includes('로그아웃') || pageText.includes('seedgrow') || pageText.includes('디커빈');
+            const isLoggedIn = pageText.includes('로그아웃') 
+                || pageText.includes('seedgrow') 
+                || pageText.includes('디커빈')
+                || pageText.includes('메인서비스')          // ★ 대시보드 메뉴
+                || pageText.includes('기본정보관리')         // ★ 대시보드 메뉴
+                || afterLoginUrl.includes('login_process')  // ★ 로그인 처리 URL
+                || afterLoginUrl.includes('ga67.ezadmin');   // ★ ga67로 리다이렉트됨
             
             let loginScreenshot = null;
             try { loginScreenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
 
             if (isLoggedIn) {
-                console.log('📍 [EZADMIN LOGIN] ✅ 로그인 성공 확인! (로그아웃 버튼 또는 계정명 발견)');
+                console.log('📍 [EZADMIN LOGIN] ✅ 로그인 성공 확인!');
                 isProcessing = false;
                 return res.json({ status: 'SUCCESS', message: '로그인 완료', currentUrl: afterLoginUrl, screenshot: loginScreenshot });
             }
 
-            // 6-4: 로그인 팝업도 없고, 로그아웃 버튼도 없음 — 애매한 상태
+            // 6-4: 어디에도 해당 안 됨
             console.log(`📍 [EZADMIN LOGIN] ⚠️ 로그인 상태 불명확. URL: ${afterLoginUrl}`);
             console.log(`📍 [EZADMIN LOGIN] 페이지 텍스트 앞 300자: ${pageText.substring(0, 300)}`);
             isProcessing = false;
@@ -209,106 +177,113 @@ async function execute(action, req, res) {
                 return res.status(400).json({ status: 'ERROR', message: '브라우저 세션 없음. 로그인 먼저.' });
             }
 
-            // ★ STEP 1: ga67 재고 페이지 이동
-            console.log('\n📍 [EZADMIN SCRAPE] STEP 1: ga67 재고 페이지 이동...');
             const targetUrl = 'https://ga67.ezadmin.co.kr/template35.htm?template=I100';
+            const MAX_RETRIES = 3;
             
-            try {
-                await globalPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            } catch (gotoErr) {
-                console.log(`📍 [EZADMIN SCRAPE] ❌ 페이지 로드 실패: ${gotoErr.message}`);
-                let screenshot = null;
-                try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
-                isProcessing = false;
-                return res.status(500).json({
-                    status: 'ERROR',
-                    message: 'ga67 페이지 로드 타임아웃 (60초)',
-                    screenshot: screenshot
-                });
-            }
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                console.log(`\n📍 [EZADMIN SCRAPE] === 시도 ${attempt}/${MAX_RETRIES} ===`);
 
-            await globalPage.waitForTimeout(3000);
-
-            // ★ STEP 2: 페이지 상태 확인
-            const currentUrl = globalPage.url();
-            let bodyText = '';
-            try { bodyText = await globalPage.textContent('body') || ''; } catch(e) {}
-            console.log(`📍 [EZADMIN SCRAPE] 현재 URL: ${currentUrl}`);
-            console.log(`📍 [EZADMIN SCRAPE] 페이지 앞 200자: ${bodyText.substring(0, 200)}`);
-
-            // DB 에러 감지
-            if (bodyText.includes('mysqli') || bodyText.includes('데이터베이스에 연결할 수 없습니다')) {
-                console.log('📍 [EZADMIN SCRAPE] ⚠️ Ezadmin DB 에러!');
-                let screenshot = null;
-                try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
-                isProcessing = false;
-                return res.status(503).json({
-                    status: 'ERROR',
-                    message: 'Ezadmin 서버 DB 연결 에러',
-                    screenshot: screenshot
-                });
-            }
-
-            // 세션 만료 감지
-            if (currentUrl.includes('ezadmin.co.kr/index') || bodyText.includes('login-domain')) {
-                console.log('📍 [EZADMIN SCRAPE] ⚠️ 세션 만료!');
-                let screenshot = null;
-                try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
-                isProcessing = false;
-                return res.status(401).json({
-                    status: 'ERROR',
-                    message: '세션 만료 — 로그인을 다시 하세요',
-                    screenshot: screenshot
-                });
-            }
-
-            // ★ STEP 3: #search 버튼 대기 + 클릭
-            console.log('📍 [EZADMIN SCRAPE] STEP 3: 검색 버튼 대기...');
-            try {
-                await globalPage.waitForSelector('#search', { timeout: 30000 });
-            } catch (selectorErr) {
-                console.log('📍 [EZADMIN SCRAPE] ❌ #search 버튼 미발견');
-                let screenshot = null;
-                try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
-                isProcessing = false;
-                return res.status(500).json({
-                    status: 'ERROR',
-                    message: '#search 버튼 미발견 (30초 타임아웃)',
-                    bodyPreview: bodyText.substring(0, 500),
-                    screenshot: screenshot
-                });
-            }
-
-            console.log('📍 [EZADMIN SCRAPE] STEP 3.5: 검색 버튼 클릭...');
-            await globalPage.click('#search');
-            await globalPage.waitForTimeout(7000);
-
-            // ★ STEP 4: 데이터 파싱
-            console.log('📍 [EZADMIN SCRAPE] STEP 4: jqxGrid 데이터 파싱...');
-            const stockData = await globalPage.evaluate(() => {
-                const rows = document.querySelectorAll('#grid1 tbody tr[role="row"]');
-                const results = [];
-                rows.forEach(row => {
-                    const cells = row.querySelectorAll('td[role="gridcell"]');
-                    if (cells.length > 0) {
-                        const rowData = {};
-                        cells.forEach(cell => {
-                            const colId = cell.getAttribute('aria-describedby');
-                            if (colId) {
-                                rowData[colId] = (cell.textContent || '').trim();
-                            }
-                        });
-                        if (Object.keys(rowData).length > 0) {
-                            results.push(rowData);
-                        }
+                // ★ STEP 1: ga67 재고 페이지 이동
+                console.log('📍 [EZADMIN SCRAPE] STEP 1: ga67 재고 페이지 이동...');
+                try {
+                    await globalPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                } catch (gotoErr) {
+                    console.log(`📍 [EZADMIN SCRAPE] ❌ 페이지 로드 실패: ${gotoErr.message}`);
+                    if (attempt < MAX_RETRIES) {
+                        console.log(`📍 [EZADMIN SCRAPE] 🔄 10초 후 재시도...`);
+                        await globalPage.waitForTimeout(10000);
+                        continue;
                     }
-                });
-                return results;
-            });
+                    let screenshot = null;
+                    try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+                    isProcessing = false;
+                    return res.status(500).json({ status: 'ERROR', message: 'ga67 페이지 로드 타임아웃', screenshot });
+                }
 
-            console.log(`📍 [EZADMIN SCRAPE] ✅ 총 ${stockData.length}건 재고 추출 완료!`);
+                await globalPage.waitForTimeout(3000);
+
+                // ★ STEP 2: 페이지 상태 확인
+                const currentUrl = globalPage.url();
+                let bodyText = '';
+                try { bodyText = await globalPage.textContent('body') || ''; } catch(e) {}
+                console.log(`📍 [EZADMIN SCRAPE] 현재 URL: ${currentUrl}`);
+                console.log(`📍 [EZADMIN SCRAPE] 페이지 앞 200자: ${bodyText.substring(0, 200)}`);
+
+                // DB 에러 감지 → 재시도
+                if (bodyText.includes('mysqli') || bodyText.includes('데이터베이스에 연결할 수 없습니다')) {
+                    console.log(`📍 [EZADMIN SCRAPE] ⚠️ DB 에러 감지! (시도 ${attempt}/${MAX_RETRIES})`);
+                    if (attempt < MAX_RETRIES) {
+                        console.log(`📍 [EZADMIN SCRAPE] 🔄 15초 후 재시도...`);
+                        await new Promise(r => setTimeout(r, 15000));
+                        continue;
+                    }
+                    let screenshot = null;
+                    try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+                    isProcessing = false;
+                    return res.status(503).json({ status: 'ERROR', message: `Ezadmin DB 에러 (${MAX_RETRIES}회 시도 실패)`, screenshot });
+                }
+
+                // 세션 만료 감지
+                if (currentUrl.includes('ezadmin.co.kr/index') || bodyText.includes('login-domain')) {
+                    console.log('📍 [EZADMIN SCRAPE] ⚠️ 세션 만료!');
+                    let screenshot = null;
+                    try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+                    isProcessing = false;
+                    return res.status(401).json({ status: 'ERROR', message: '세션 만료 — 로그인 다시', screenshot });
+                }
+
+                // ★ STEP 3: #search 버튼 대기 + 클릭
+                console.log('📍 [EZADMIN SCRAPE] STEP 3: 검색 버튼 대기...');
+                try {
+                    await globalPage.waitForSelector('#search', { timeout: 30000 });
+                } catch (selectorErr) {
+                    console.log('📍 [EZADMIN SCRAPE] ❌ #search 버튼 미발견');
+                    if (attempt < MAX_RETRIES) {
+                        console.log(`📍 [EZADMIN SCRAPE] 🔄 10초 후 재시도...`);
+                        await new Promise(r => setTimeout(r, 10000));
+                        continue;
+                    }
+                    let screenshot = null;
+                    try { screenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
+                    isProcessing = false;
+                    return res.status(500).json({ status: 'ERROR', message: '#search 미발견', bodyPreview: bodyText.substring(0, 500), screenshot });
+                }
+
+                console.log('📍 [EZADMIN SCRAPE] STEP 3.5: 검색 버튼 클릭...');
+                await globalPage.click('#search');
+                await globalPage.waitForTimeout(7000);
+
+                // ★ STEP 4: 데이터 파싱
+                console.log('📍 [EZADMIN SCRAPE] STEP 4: jqxGrid 데이터 파싱...');
+                const stockData = await globalPage.evaluate(() => {
+                    const rows = document.querySelectorAll('#grid1 tbody tr[role="row"]');
+                    const results = [];
+                    rows.forEach(row => {
+                        const cells = row.querySelectorAll('td[role="gridcell"]');
+                        if (cells.length > 0) {
+                            const rowData = {};
+                            cells.forEach(cell => {
+                                const colId = cell.getAttribute('aria-describedby');
+                                if (colId) {
+                                    rowData[colId] = (cell.textContent || '').trim();
+                                }
+                            });
+                            if (Object.keys(rowData).length > 0) {
+                                results.push(rowData);
+                            }
+                        }
+                    });
+                    return results;
+                });
+
+                console.log(`📍 [EZADMIN SCRAPE] ✅ 총 ${stockData.length}건 재고 추출 완료!`);
+                isProcessing = false;
+                return res.json({ status: 'SUCCESS', count: stockData.length, data: stockData });
+            }
+
+            // 여기까지 오면 모든 재시도 실패
             isProcessing = false;
-            return res.json({ status: 'SUCCESS', count: stockData.length, data: stockData });
+            return res.status(500).json({ status: 'ERROR', message: '모든 재시도 실패' });
         }
 
         isProcessing = false;
