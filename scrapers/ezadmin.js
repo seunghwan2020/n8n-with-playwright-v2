@@ -92,8 +92,10 @@ async function execute(action, req, res) {
             const isLoginPopupVisible = await globalPage.isVisible('#login-domain');
             if (!isLoginPopupVisible) {
                 console.log('📍 [EZADMIN LOGIN] ✅ 이미 로그인됨!');
+                let loginScreenshot = null;
+                try { loginScreenshot = 'data:image/png;base64,' + (await globalPage.screenshot()).toString('base64'); } catch(e) {}
                 isProcessing = false;
-                return res.json({ status: 'SUCCESS', message: '자동 로그인 성공' });
+                return res.json({ status: 'SUCCESS', message: '자동 로그인 성공', screenshot: loginScreenshot });
             }
 
             // ★ STEP 4: 정보 입력
@@ -126,8 +128,19 @@ async function execute(action, req, res) {
                 // 보안코드 없음 = 로그인 성공
                 const currentUrl = globalPage.url();
                 console.log(`📍 [EZADMIN LOGIN] ✅ 로그인 성공! 현재 URL: ${currentUrl}`);
+                
+                // ★ 로그인 후 스크린샷 캡처 (실제 로그인 확인용)
+                let loginScreenshot = null;
+                try {
+                    const buffer = await globalPage.screenshot();
+                    loginScreenshot = 'data:image/png;base64,' + buffer.toString('base64');
+                    console.log('📍 [EZADMIN LOGIN] 📸 로그인 후 스크린샷 캡처 완료');
+                } catch (ssErr) {
+                    console.log(`📍 [EZADMIN LOGIN] 스크린샷 실패: ${ssErr.message}`);
+                }
+                
                 isProcessing = false;
-                return res.json({ status: 'SUCCESS', message: '로그인 완료' });
+                return res.json({ status: 'SUCCESS', message: '로그인 완료', currentUrl: currentUrl, screenshot: loginScreenshot });
             }
         }
 
