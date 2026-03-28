@@ -19,7 +19,7 @@ function getProxyConfig() {
         console.log(`📍 [PROXY] 한국 Residential Proxy 사용: ${PROXY_HOST}:${PROXY_PORT}`);
         return {
             server: `http://${PROXY_HOST}:${PROXY_PORT}`,
-            username: PROXY_USER,
+            username: `${PROXY_USER}__cr.kr`,
             password: PROXY_PASS
         };
     }
@@ -54,6 +54,16 @@ async function execute(action, req, res) {
 
             const context = await globalBrowser.newContext(contextOptions);
             globalPage = await context.newPage();
+
+            // ★ 프록시 IP 확인 (한국 IP인지 검증)
+            console.log('📍 [EZADMIN LOGIN] STEP 1.5: 프록시 출구 IP 확인...');
+            try {
+                await globalPage.goto('https://api.ipify.org?format=json', { timeout: 15000 });
+                const ipText = await globalPage.textContent('body');
+                console.log(`📍 [PROXY] 출구 IP: ${ipText}`);
+            } catch (ipErr) {
+                console.log(`📍 [PROXY] IP 확인 실패: ${ipErr.message}`);
+            }
 
             console.log('📍 [EZADMIN LOGIN] STEP 2: 메인 페이지 접속...');
             await globalPage.goto('https://ezadmin.co.kr/index.html', { timeout: 60000 });
