@@ -8,12 +8,14 @@ const handler11st = require('./scrapers/11st.js');
 const handlerEzadmin = require('./scrapers/ezadmin.js');
 // 🌟 네이버 스토어 크롤링 모듈 추가
 const handlerNaverStore = require('./scrapers/naver_store.js');
+// 🌟 FITLOGIC 창고관리 모듈 추가 (이벗 대체, 2026.09~)
+const handlerFitlogic = require('./scrapers/fitlogic.js');
 
 app.post('/execute', async (req, res) => {
     const { site, action } = req.body;
 
     if (!site) {
-        return res.status(400).json({ status: 'ERROR', message: '어느 사이트인지 site 파라미터를 보내주세요. (예: 11st, ezadmin, naver_store)' });
+        return res.status(400).json({ status: 'ERROR', message: '어느 사이트인지 site 파라미터를 보내주세요. (예: 11st, ezadmin, naver_store, fitlogic)' });
     }
 
     try {
@@ -25,6 +27,8 @@ app.post('/execute', async (req, res) => {
             await handlerEzadmin.execute(action, req, res);
         } else if (site === 'naver_store') {
             await handlerNaverStore.execute(action, req, res);
+        } else if (site === 'fitlogic') {
+            await handlerFitlogic.execute(action, req, res);
         } else {
             res.status(404).json({ status: 'ERROR', message: `아직 지원하지 않는 사이트입니다: ${site}` });
         }
