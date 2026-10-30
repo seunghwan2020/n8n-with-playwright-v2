@@ -274,44 +274,85 @@ async function scrape(params) {
     result.debug.stateMethod = stateInfo.method;
 
     // [INTEREST] 관심고객수: ① 화면 글자 ② __PRELOADED_STATE__ 키 ③ 네트워크 응답
-    try {
-      var it = await page.evaluate(function() {
-        var out = { dom: null, domText: '', paths: [] };
-        try {
-          var body = (document.body && document.body.innerText) || '';
-          var m = body.match(/관심\s*고객\s*(?:수)?\s*([\d,]+(?:\.\d+)?)\s*(만)?/);
-          if (m) {
-            var n = parseFloat(m[1].replace(/,/g, ''));
-            if (m[2]) n = Math.round(n * 10000);
-            out.dom = n; out.domText = m[0].substring(0, 40);
-          }
-        } catch (e) {}
-        try {
-          var st = window.__PRELOADED_STATE__;
-          var seen = 0;
-          (function walk(o, path, d) {
-            if (!o || typeof o !== 'object' || d > 5 || seen > 4000) return;
-            var keys = Object.keys(o);
-            for (var i = 0; i < keys.length; i++) {
-              seen++;
-              var k = keys[i], v = o[k];
-              if (/interest|follow|zzim|keep|subscri|favorite/i.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v)))) {
-                if (out.paths.length < 15) out.paths.push({ path: path + k, value: Number(v) });
-              } else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.', d + 1);
-            }
-          })(st, '', 0);
-        } catch (e) {}
-        return out;
-      });
-      var pick = null, src = '';
-      if (it.dom != null) { pick = it.dom; src = 'dom'; }
-      if (pick == null) {
-        for (var ipi = 0; ipi < it.paths.length; ipi++) {
-          if (/count|cnt/i.test(it.paths[ipi].path) && it.paths[ipi].value > 0) { pick = it.paths[ipi].value; src = 'state:' + it.paths[ipi].path; break; }
+    //   스마트스토어는 상품 목록 화면에 숫자가 없을 수 있어 → 스토어 홈을 따로 열어 다시 찾고, smart-stores API 값도 본다
+    var interestProbe = function() {
+      var out = { dom: null, domText: '', paths: [], snips: [] };
+      try {
+        var body = (document.body && document.body.innerText) || '';
+        var m = body.match(/관심\s*고객\s*(?:수)?\s*([\d,]+(?:\.\d+)?)\s*(만)?/);
+        if (m) {
+          var n = parseFloat(m[1].replace(/,/g, ''));
+          if (m[2]) n = Math.round(n * 10000);
+          out.dom = n; out.domText = m[0].substring(0, 40);
         }
+        var re = /.{0,20}관심.{0,24}/g, mm, c = 0;
+        while ((mm = re.exec(body)) && c < 4) { out.snips.push(mm[0].replace(/\s+/g, ' ')); c++; }
+      } catch (e) {}
+      try {
+        var st = window.__PRELOADED_STATE__;
+        var seen = 0;
+        (function walk(o, path, d) {
+          if (!o || typeof o !== 'object' || d > 7 || seen > 8000) return;
+          var keys = Object.keys(o);
+          for (var i = 0; i < keys.length; i++) {
+            seen++;
+            var k = keys[i], v = o[k];
+            if (/interest|follow|zzim|keep|subscri|favorite|fan/i.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v)))) {
+              if (out.paths.length < 15) out.paths.push({ path: path + k, value: Number(v) });
+            } else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.', d + 1);
+          }
+        })(st, '', 0);
+      } catch (e) {}
+      return out;
+    };
+    var interestPick = function(it) {
+      if (it.dom != null) return { v: it.dom, src: 'dom' };
+      for (var ipi = 0; ipi < it.paths.length; ipi++) {
+        if (/count|cnt/i.test(it.paths[ipi].path) && it.paths[ipi].value > 0) return { v: it.paths[ipi].value, src: 'state:' + it.paths[ipi].path };
       }
-      result.store_interest = pick;
-      result.debug.interest = { src: src, domText: it.domText, statePaths: it.paths, net: interestNet.slice(0, 8) };
+      return { v: null, src: '' };
+    };
+    try {
+      var it = await page.evaluate(interestProbe);
+      var ip = interestPick(it), home = null, api = null;
+      if (ip.v == null && storeType === 'smartstore') {
+        try {
+          var hp = await ctx.newPage();
+          await hp.addInitScript(stealth);
+          await hp.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await hp.waitForTimeout(4000);
+          home = await hp.evaluate(interestProbe);
+          ip = interestPick(home); if (ip.v != null) ip.src = 'home:' + ip.src;
+          if (ip.v == null) {
+            api = await hp.evaluate(function(slug) {
+              return fetch('https://smartstore.naver.com/i/v1/smart-stores?url=' + encodeURIComponent(slug), { credentials: 'include' })
+                .then(function(r) { return r.ok ? r.json() : null; })
+                .then(function(j) {
+                  if (!j) return null;
+                  var hit = [], keys = [];
+                  (function walk(o, path, d) {
+                    if (!o || typeof o !== 'object' || d > 5) return;
+                    Object.keys(o).forEach(function(k) {
+                      var v = o[k];
+                      if (d < 2 && keys.length < 60) keys.push(path + k);
+                      if (/interest|follow|zzim|keep|subscri|favorite|fan/i.test(k) && typeof v === 'number') hit.push({ path: path + k, value: v });
+                      else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.', d + 1);
+                    });
+                  })(j, '', 0);
+                  return { hit: hit.slice(0, 10), keys: keys };
+                }).catch(function() { return null; });
+            }, storeSlug);
+            if (api && api.hit) {
+              for (var ahi = 0; ahi < api.hit.length; ahi++) {
+                if (/count|cnt/i.test(api.hit[ahi].path) && api.hit[ahi].value > 0) { ip = { v: api.hit[ahi].value, src: 'api:' + api.hit[ahi].path }; break; }
+              }
+            }
+          }
+          await hp.close();
+        } catch (e) { home = home || { err: String(e).substring(0, 80) }; }
+      }
+      result.store_interest = ip.v;
+      result.debug.interest = { src: ip.src, domText: it.domText, snips: it.snips, statePaths: it.paths, net: interestNet.slice(0, 8), home: home, api: api };
     } catch (e) {
       result.store_interest = null;
       result.debug.interest = { err: String(e).substring(0, 100) };
