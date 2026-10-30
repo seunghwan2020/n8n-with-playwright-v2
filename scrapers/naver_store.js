@@ -55,6 +55,28 @@ async function scrape(params) {
     page = await ctx.newPage();
     await page.addInitScript(stealth);
 
+    // [INTEREST] 관심고객수 관련 네트워크 응답 기록 (읽기만)
+    var interestNet = [];
+    page.on('response', function(resp) {
+      try {
+        var u = resp.url();
+        if (interestNet.length >= 8) return;
+        if (!/interest|follow|zzim|keep|subscri|favorite|marketing-message/i.test(u)) return;
+        resp.json().then(function(j) {
+          var nums = {};
+          (function walk(o, path, d) {
+            if (!o || typeof o !== 'object' || d > 3) return;
+            Object.keys(o).forEach(function(k) {
+              var v = o[k];
+              if (typeof v === 'number' && Object.keys(nums).length < 12) nums[path + k] = v;
+              else if (v && typeof v === 'object') walk(v, path + k + '.', d + 1);
+            });
+          })(j, '', 0);
+          interestNet.push({ url: u.replace(/^https?:\/\/[^/]+/, '').substring(0, 160), nums: nums });
+        }).catch(function() {});
+      } catch (e) {}
+    });
+
     var baseUrl, apiBase;
     if (storeType === 'smartstore') {
       baseUrl = 'https://smartstore.naver.com/' + storeSlug;
@@ -250,6 +272,50 @@ async function scrape(params) {
     result.debug.totalIds = stateInfo.allIds.length;
     result.debug.extraPageIds = extraPageIds.length;
     result.debug.stateMethod = stateInfo.method;
+
+    // [INTEREST] 관심고객수: ① 화면 글자 ② __PRELOADED_STATE__ 키 ③ 네트워크 응답
+    try {
+      var it = await page.evaluate(function() {
+        var out = { dom: null, domText: '', paths: [] };
+        try {
+          var body = (document.body && document.body.innerText) || '';
+          var m = body.match(/관심\s*고객\s*(?:수)?\s*([\d,]+(?:\.\d+)?)\s*(만)?/);
+          if (m) {
+            var n = parseFloat(m[1].replace(/,/g, ''));
+            if (m[2]) n = Math.round(n * 10000);
+            out.dom = n; out.domText = m[0].substring(0, 40);
+          }
+        } catch (e) {}
+        try {
+          var st = window.__PRELOADED_STATE__;
+          var seen = 0;
+          (function walk(o, path, d) {
+            if (!o || typeof o !== 'object' || d > 5 || seen > 4000) return;
+            var keys = Object.keys(o);
+            for (var i = 0; i < keys.length; i++) {
+              seen++;
+              var k = keys[i], v = o[k];
+              if (/interest|follow|zzim|keep|subscri|favorite/i.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v)))) {
+                if (out.paths.length < 15) out.paths.push({ path: path + k, value: Number(v) });
+              } else if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + k + '.', d + 1);
+            }
+          })(st, '', 0);
+        } catch (e) {}
+        return out;
+      });
+      var pick = null, src = '';
+      if (it.dom != null) { pick = it.dom; src = 'dom'; }
+      if (pick == null) {
+        for (var ipi = 0; ipi < it.paths.length; ipi++) {
+          if (/count|cnt/i.test(it.paths[ipi].path) && it.paths[ipi].value > 0) { pick = it.paths[ipi].value; src = 'state:' + it.paths[ipi].path; break; }
+        }
+      }
+      result.store_interest = pick;
+      result.debug.interest = { src: src, domText: it.domText, statePaths: it.paths, net: interestNet.slice(0, 8) };
+    } catch (e) {
+      result.store_interest = null;
+      result.debug.interest = { err: String(e).substring(0, 100) };
+    }
 
     // smartstore API 페이지 준비
     var apiPage = page;
