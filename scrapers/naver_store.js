@@ -1,13 +1,29 @@
 const { chromium } = require('playwright');
 
 let browser = null;
+// v37 (2026-11-10): 서버가 통째로 멈추던 문제 대책
+//  - 한 번 수집이 끝없이 걸리면(페이지 안 fetch에 시간 제한이 없었음) 그 창이 계속 열려 메모리가 쌓이고, 결국 브라우저가 멎어 모든 요청이 240초 초과로 실패 → 서버 재시작 전까지 복구 안 됨
+//  - 수집 1건 최대 200초(넘으면 창을 강제로 닫고 ERROR로 답함), 페이지 안 fetch 15초 제한
+//  - 브라우저 재시작: 강제 종료가 있었거나 수집 40건마다, 진행 중인 수집이 없을 때 새 브라우저로
+//  - 관심고객수: 같은 가게는 6시간에 한 번만 따로 찾음(스마트스토어 홈 추가 열기 줄임)
+const SCRAPE_DEADLINE_MS = 200000, RECYCLE_EVERY = 40, INTEREST_TTL_MS = 6 * 3600 * 1000;
+let active = 0, served = 0, recycle = false;
+const interestCache = {};
+function status() { return { active: active, served: served, recycle: recycle, connected: !!(browser && browser.isConnected()) }; }
 
+let launching = null; // v37: 동시에 들어온 요청이 브라우저를 두 개 띄우지 않게(전에는 서버 재시작 직후 4건이 함께 오면 여러 개가 떠서 남았음)
 async function getBrowser() {
+  if (browser && recycle && active <= 1) { // 이 요청 말고 진행 중인 수집이 없을 때만 교체
+    console.log('[naver_store v37] 브라우저 새로 시작 (served=' + served + ')');
+    var old = browser; browser = null; recycle = false;
+    try { await old.close(); } catch (e) {}
+  }
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
+    if (!launching) launching = chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
-    });
+    }).then(function(b) { browser = b; launching = null; return b; }, function(e) { launching = null; throw e; });
+    return launching;
   }
   return browser;
 }
@@ -38,7 +54,8 @@ var stealth = function() {
 // [FIX-5] consecutive429 per-batch 추적으로 변경
 // [FIX-6] 429 retry: 1회→2회, wait 2s→3s
 // [FIX-7] today→weekly 2차 호출 delay 100ms→200ms
-async function scrape(params) {
+async function scrape(params, tok) {
+  tok = tok || {};
   var storeSlug = params.store_slug || 'dcurvin';
   var storeType = params.store_type || 'brand';
   var result = {
@@ -48,10 +65,15 @@ async function scrape(params) {
   };
 
   var br = null; var ctx = null; var page = null;
+  var killer = null, killed = false;
+  active++; served++;
+  if (served % RECYCLE_EVERY === 0) recycle = true;
 
   try {
     br = await getBrowser();
     ctx = await br.newContext(ctxOpts());
+    // v37: 200초 넘으면 창을 강제로 닫음 → 걸려 있던 작업이 바로 오류로 끝나고 아래 finally에서 정리
+    killer = setTimeout(function() { killed = true; recycle = true; console.log('[naver_store v37] 시간 초과로 강제 종료: ' + storeSlug); try { ctx.close().catch(function() {}); } catch (e) {} }, SCRAPE_DEADLINE_MS);
     page = await ctx.newPage();
     await page.addInitScript(stealth);
 
@@ -251,7 +273,7 @@ async function scrape(params) {
         console.log('[v36] channelUid not found, trying smart-stores API...');
         var resolveResult = await page.evaluate(function(slug) {
           var url = 'https://smartstore.naver.com/i/v1/smart-stores?url=' + encodeURIComponent(slug);
-          return fetch(url, { credentials: 'include' })
+          return fetch(url, { signal: AbortSignal.timeout(15000), credentials: 'include' })
             .then(function(r) { return r.ok ? r.json() : null; })
             .catch(function() { return null; });
         }, storeSlug);
@@ -315,6 +337,8 @@ async function scrape(params) {
     try {
       var it = await page.evaluate(interestProbe);
       var ip = interestPick(it), home = null, api = null;
+      var ic = interestCache[storeSlug];
+      if (ip.v == null && ic && Date.now() - ic.at < INTEREST_TTL_MS) { ip = { v: ic.v, src: 'cache:' + ic.src }; } // v37: 6시간 안에 찾은 값이면 홈을 다시 열지 않음
       if (ip.v == null && storeType === 'smartstore') {
         try {
           var hp = await ctx.newPage();
@@ -325,7 +349,7 @@ async function scrape(params) {
           ip = interestPick(home); if (ip.v != null) ip.src = 'home:' + ip.src;
           if (ip.v == null) {
             api = await hp.evaluate(function(slug) {
-              return fetch('https://smartstore.naver.com/i/v1/smart-stores?url=' + encodeURIComponent(slug), { credentials: 'include' })
+              return fetch('https://smartstore.naver.com/i/v1/smart-stores?url=' + encodeURIComponent(slug), { signal: AbortSignal.timeout(15000), credentials: 'include' })
                 .then(function(r) { return r.ok ? r.json() : null; })
                 .then(function(j) {
                   if (!j) return null;
@@ -351,6 +375,7 @@ async function scrape(params) {
           await hp.close();
         } catch (e) { home = home || { err: String(e).substring(0, 80) }; }
       }
+      if (ip.v != null && !/^cache:/.test(ip.src || '')) interestCache[storeSlug] = { v: ip.v, src: ip.src, at: Date.now() };
       result.store_interest = ip.v;
       result.debug.interest = { src: ip.src, domText: it.domText, snips: it.snips, statePaths: it.paths, net: interestNet.slice(0, 8), home: home, api: api };
     } catch (e) {
@@ -388,7 +413,7 @@ async function scrape(params) {
         for (var apiPg = 1; apiPg <= 10; apiPg++) {
           var productsResult = await p15Page.evaluate(function(args) {
             var url = args.urlBase + '?categorySearchType=DISPCATG&sortType=POPULAR&page=' + args.page + '&pageSize=40';
-            return fetch(url, { credentials: 'include' })
+            return fetch(url, { signal: AbortSignal.timeout(15000), credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : null; })
               .catch(function() { return null; });
           }, { urlBase: p15UrlBase, page: apiPg });
@@ -511,7 +536,7 @@ async function scrape(params) {
             var qs = args.ids.map(function(id) { return 'ids[]=' + id; }).join('&');
             var url = args.apiBase + '/n/v2/channels/' + args.uid + '/simple-products?' + qs
               + '&useChannelProducts=false&excludeAuthBlind=false&excludeDisplayableFilter=false&forceOrder=true';
-            return fetch(url, { credentials: 'include' })
+            return fetch(url, { signal: AbortSignal.timeout(15000), credentials: 'include' })
               .then(function(r) { return r.ok ? r.json() : { _failed: true, _status: r.status }; })
               .catch(function(e) { return { _failed: true, _error: String(e) }; });
           }, { uid: stateInfo.channelUid, ids: batch, apiBase: apiBase });
@@ -603,7 +628,7 @@ async function scrape(params) {
 
           function doFetch(url, retry) {
             retry = retry || 0;
-            return fetch(url, { credentials: 'include', cache: 'no-store' })
+            return fetch(url, { signal: AbortSignal.timeout(15000), credentials: 'include', cache: 'no-store' })
               .then(function(r) {
                 if (r.status === 429) return { _fail: true, _status: 429, _rateLimited: true };
                 if (!r.ok) return { _fail: true, _status: r.status };
@@ -757,12 +782,16 @@ async function scrape(params) {
     if (result.data.length === 0) { result.status = 'EMPTY'; result.error = 'No products found'; }
   } catch (e) {
     result.status = 'ERROR';
-    result.error = e.message || String(e);
+    result.error = killed ? ('시간 초과(' + (SCRAPE_DEADLINE_MS / 1000) + '초) — 강제 종료') : (e.message || String(e));
   } finally {
+    if (killer) clearTimeout(killer);
     try { if (apiPage && apiPage !== page) await apiPage.close(); } catch(x) {}
     try { if (page) await page.close(); } catch(x) {}
     try { if (ctx) await ctx.close(); } catch(x) {}
+    if (!tok.gone) active = Math.max(0, active - 1);
   }
+  if (killed && result.status === 'OK') { result.status = 'ERROR'; result.error = '시간 초과 — 강제 종료'; }
+  result.debug.v37 = status();
   return result;
 }
 
@@ -792,10 +821,23 @@ async function spy(params) {
 async function execute(action, req, res) {
   console.log('[naver_store v36] action=' + action);
   try {
-    if (action === 'scrape') return res.json(await scrape(req.body));
+    if (action === 'scrape') {
+      // v37: 브라우저 자체가 멎어 창을 못 여는 경우까지 — 215초 안에 답이 없으면 브라우저를 버리고 새로 띄움
+      var tm = null, tok = {};
+      var late = new Promise(function(resolve) { tm = setTimeout(function() {
+        console.log('[naver_store v37] 응답 없음 — 브라우저 교체');
+        tok.gone = true; active = Math.max(0, active - 1);
+        var b = browser; browser = null; recycle = false;
+        try { if (b) b.close().catch(function() {}); } catch (e) {}
+        resolve({ status: 'ERROR', data: [], error: '서버 응답 시간 초과 — 브라우저 교체', debug: { storeSlug: (req.body || {}).store_slug, storeType: (req.body || {}).store_type, v37: status() } });
+      }, SCRAPE_DEADLINE_MS + 15000); });
+      var out = await Promise.race([scrape(req.body, tok), late]);
+      clearTimeout(tm);
+      return res.json(out);
+    }
     if (action === 'spy') return res.json(await spy(req.body));
     return res.status(400).json({ status: 'ERROR', message: 'Unknown action: ' + action });
   } catch(e) { if (!res.headersSent) return res.status(500).json({ status: 'ERROR', error: e.message || String(e) }); }
 }
 
-module.exports = { execute };
+module.exports = { execute, status };

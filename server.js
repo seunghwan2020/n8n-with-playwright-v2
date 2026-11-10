@@ -11,6 +11,9 @@ const handlerNaverStore = require('./scrapers/naver_store.js');
 // 🌟 FITLOGIC 창고관리 모듈 추가 (이벗 대체, 2026.09~)
 const handlerFitlogic = require('./scrapers/fitlogic.js');
 
+// v37: 살아 있는지 확인용 — 네이버 스토어 수집 브라우저 상태(진행 중·누적 건수)
+app.get('/health', (req, res) => { res.json({ ok: true, uptime_s: Math.round(process.uptime()), mem_mb: Math.round(process.memoryUsage().rss / 1048576), naver_store: handlerNaverStore.status ? handlerNaverStore.status() : null }); });
+
 app.post('/execute', async (req, res) => {
     const { site, action } = req.body;
 
